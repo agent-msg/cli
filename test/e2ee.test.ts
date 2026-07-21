@@ -66,7 +66,7 @@ async function bob(...argv: string[]) {
 describe("E2EE end-to-end through the CLI", () => {
   it("encrypts to a saved contact so the server never sees plaintext, and the recipient decrypts", async () => {
     const secret = "deploy key is in the vault 秘密 🔐";
-    await bob("register", "--dev-user", "99", "--dev-login", "bob");
+    await bob("register", "--dev-user", "99", "--dev-login", "bob", "--allow-insecure-http");
     // Bob saves Alice's address card (session id + public key).
     await bob("contact", "add", "alice", "--sid", "alice_sid", "--pubkey", aliceKeys.publicKey, "--user", "42");
     await bob("send", "--to", "alice", "--text", secret);
@@ -83,11 +83,11 @@ describe("E2EE end-to-end through the CLI", () => {
     expect(plain).toBe(secret);
   });
 
-  it("warns and sends plaintext when the recipient's public key is unknown", async () => {
-    await bob("register", "--dev-user", "99", "--dev-login", "bob");
-    // A raw session id with no saved contact => no public key => plaintext.
-    await bob("send", "--to", "raw_sid", "--text", "hello in the clear");
-    expect(store[0].enc).toBeUndefined();
-    expect(store[0].text).toBe("hello in the clear");
+  it("fails closed (no send) when the recipient's public key is unknown", async () => {
+    await bob("register", "--dev-user", "99", "--dev-login", "bob", "--allow-insecure-http");
+    // A raw session id with no saved contact => no public key => refuse to send.
+    const code = await bob("send", "--to", "raw_sid", "--text", "hello in the clear");
+    expect(code).toBe(1);
+    expect(store).toHaveLength(0);
   });
 });

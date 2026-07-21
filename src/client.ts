@@ -67,11 +67,45 @@ export interface SendInput {
   enc?: string;
 }
 
+import { normalizeServerUrl } from "./serverurl.js";
+
+const REQUEST_TIMEOUT_MS = 30_000;
+const MAX_RESPONSE_BYTES = 8 << 20; // 8 MiB — well above any legitimate inbox page
+
+// readCapped drains the body but aborts if it exceeds max, so an unbounded or
+// hostile response can't grow memory without limit.
+async function readCapped(resp: Response, max: number): Promise<string> {
+  const cl = Number(resp.headers.get("content-length") || "");
+  if (Number.isFinite(cl) && cl > max) throw new ApiError(0, "response_too_large", `response exceeds ${max} bytes`);
+  if (!resp.body) return resp.text();
+  const reader = resp.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) {
+      await reader.cancel();
+      throw new ApiError(0, "response_too_large", `response exceeds ${max} bytes`);
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 export class Client {
+  public serverUrl: string;
   constructor(
-    public serverUrl: string,
+    serverUrl: string,
     public token = "",
-  ) {}
+  ) {
+    // Defense in depth (SEC-01): re-validate the origin here so no caller can
+    // bypass the CLI-layer check and send the bearer token somewhere unsafe.
+    // Loopback http is permitted (stays on the machine); remote http, userinfo,
+    // and non-http(s) schemes are rejected unconditionally.
+    this.serverUrl = normalizeServerUrl(serverUrl, true);
+  }
 
   private async call<T>(method: string, path: string, body?: unknown): Promise<T> {
     const headers: Record<string, string> = {};
@@ -81,8 +115,20 @@ export class Client {
       headers["Content-Type"] = "application/json";
       payload = JSON.stringify(body);
     }
-    const resp = await fetch(this.serverUrl + path, { method, headers, body: payload });
-    const raw = await resp.text();
+    // HARD-01: bound the request in time and the response in size so a malicious
+    // or wedged server can't hang the CLI or exhaust its memory.
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), REQUEST_TIMEOUT_MS);
+    let resp: Response;
+    try {
+      resp = await fetch(this.serverUrl + path, { method, headers, body: payload, signal: ctl.signal });
+    } catch (e) {
+      clearTimeout(timer);
+      if ((e as Error).name === "AbortError") throw new ApiError(0, "timeout", `request to ${path} timed out`);
+      throw e;
+    }
+    clearTimeout(timer);
+    const raw = await readCapped(resp, MAX_RESPONSE_BYTES);
     if (!resp.ok) {
       let code = "http_error";
       let msg = raw;

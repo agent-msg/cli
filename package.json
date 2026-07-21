@@ -13,7 +13,7 @@
   },
   "license": "MIT",
   "homepage": "https://agentmsg.org",
-  "repository": { "type": "git", "url": "git+https://github.com/Elarwei001/agentmsg.git" },
+  "repository": { "type": "git", "url": "git+https://github.com/Elarwei001/agentmsg_cli.git" },
   "keywords": ["agent", "messaging", "claude-code", "codex", "cli", "e2ee", "encryption"],
   "dependencies": {
     "libsodium-wrappers": "^0.7.15"

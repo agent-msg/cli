@@ -87,3 +87,23 @@ describe("Client", () => {
     expect(last.body).toEqual({ mode: "git_user", allow: ["42"], i_understand_the_risk: false });
   });
 });
+
+describe("Client hardening (HARD-01)", () => {
+  it("rejects a response larger than the cap via Content-Length", async () => {
+    reply = { status: 200, body: "x" };
+    // Force a huge declared length by overriding the handler once.
+    const big = new Client(base, "tok");
+    // Monkeypatch fetch for this call to return an oversized content-length.
+    const orig = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response("{}", { status: 200, headers: { "content-length": String(64 * 1024 * 1024) } });
+    await expect(big.inboxPage(0)).rejects.toMatchObject({ code: "response_too_large" });
+    globalThis.fetch = orig;
+  });
+
+  it("rejects a URL that would send credentials to a remote http origin", () => {
+    expect(() => new Client("http://attacker.example", "tok")).toThrow(/loopback|https/i);
+    expect(() => new Client("https://ok.example", "tok")).not.toThrow();
+    expect(() => new Client("http://127.0.0.1:9", "tok")).not.toThrow(); // loopback ok
+  });
+});

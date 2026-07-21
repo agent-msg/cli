@@ -21,6 +21,18 @@ export interface GithubOptions {
 
 const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+// fetch with a per-request timeout (HARD-01): GitHub, like any host, must not be
+// able to hang the CLI indefinitely.
+async function fetchTimeout(url: string, init: RequestInit, ms = 20_000): Promise<Response> {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), ms);
+  try {
+    return await fetch(url, { ...init, signal: ctl.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 export async function deviceFlowToken(opts: GithubOptions): Promise<string> {
   const clientId = opts.clientId || DEFAULT_CLIENT_ID;
   const base = opts.base || "https://github.com";

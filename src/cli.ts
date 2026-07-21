@@ -5,8 +5,9 @@
 import { generateKeypair, seal, open } from "./crypto.js";
 import { Client, ApiError } from "./client.js";
 import { SessionStore, Session, defaultHome } from "./session.js";
-import { Contacts } from "./contacts.js";
+import { Contacts, fingerprint } from "./contacts.js";
 import { deviceFlowToken, DEFAULT_CLIENT_ID } from "./github.js";
+import { normalizeServerUrl } from "./serverurl.js";
 
 const USAGE = `agentmsg — end-to-end encrypted messaging between AI agent sessions
 
@@ -128,7 +129,14 @@ export async function run(argv: string[]): Promise<number> {
 }
 
 async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionStore, server: string): Promise<number> {
-  const srv = (args.flags.server as string) || server;
+  // SEC-01: register sends the GitHub access token to this origin. Validate it
+  // (https by default; loopback http only with --allow-insecure-http), and
+  // surface a non-default origin before any credential leaves the machine.
+  const raw = (args.flags.server as string) || server;
+  const srv = normalizeServerUrl(raw, args.flags["allow-insecure-http"] === true);
+  if (new URL(srv).origin !== new URL(DEFAULT_SERVER).origin) {
+    note(`>> WARNING: registering with ${new URL(srv).origin} — your GitHub token and session token will be sent there.`);
+  }
   let credential: string;
   if (args.flags["dev-user"]) {
     const login = (args.flags["dev-login"] as string) || "";
@@ -169,15 +177,21 @@ function cmdContact(args: ReturnType<typeof parseArgs>, contacts: Contacts): num
   if (sub === "add") {
     const name = args._[1];
     if (!name || !args.flags.sid || !args.flags.pubkey) {
-      note("usage: agentmsg contact add NAME --sid SID --pubkey PK [--user ID]");
+      note("usage: agentmsg contact add NAME --sid SID --pubkey PK [--user ID] [--force]");
       return 2;
     }
-    contacts.add(name, { sessionId: String(args.flags.sid), publicKey: String(args.flags.pubkey), githubUserId: String(args.flags.user || "") });
-    emit({ status: "contact_saved", name });
+    const pubkey = String(args.flags.pubkey);
+    contacts.add(
+      name,
+      { sessionId: String(args.flags.sid), publicKey: pubkey, githubUserId: String(args.flags.user || "") },
+      args.flags.force === true,
+    );
+    // Show the fingerprint so the human can verify it out-of-band (SEC-05).
+    emit({ status: "contact_saved", name, fingerprint: fingerprint(pubkey) });
     return 0;
   }
   if (sub === "list") {
-    emit(contacts.list());
+    emit(contacts.list().map((c) => ({ ...c, fingerprint: fingerprint(c.publicKey) })));
     return 0;
   }
   note("usage: agentmsg contact add|list");
@@ -215,7 +229,17 @@ async function cmdSend(args: ReturnType<typeof parseArgs>, store: SessionStore, 
     const ct = await seal(text, pubkey); // encrypt on THIS machine
     resp = await client.send({ to: addr.sessionId, text: ct, enc: "box1" });
   } else {
-    note(">> no public key for recipient — sending UNENCRYPTED");
+    // SEC-04: fail closed. Without a public key we would send plaintext, which
+    // an automated agent must never do by accident. Refuse unless the human
+    // explicitly opts into an unencrypted send.
+    const forcedPlain = args.flags.plaintext === true && args.flags["i-understand-the-risk"] === true;
+    if (!forcedPlain) {
+      note(`error: no public key for "${to}" — refusing to send unencrypted.`);
+      note(`   Save the recipient's key: agentmsg contact add ${to} --sid <sid> --pubkey <pubkey>`);
+      note(`   Or, to send in the clear on purpose: add --plaintext --i-understand-the-risk`);
+      return 1;
+    }
+    note(">> sending UNENCRYPTED (--plaintext)");
     resp = await client.send({ to: addr.sessionId, text });
   }
   emit({ msg_id: resp.msg_id, seq: resp.seq, encrypted: !!pubkey });
