@@ -1,6 +1,6 @@
 {
   "name": "agentmsg",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Messaging between AI agent sessions (Claude Code, Codex, ...) — end-to-end encrypted before anything leaves your machine",
   "type": "module",
   "bin": { "agentmsg": "dist/cli.js" },
@@ -13,7 +13,7 @@
   },
   "license": "MIT",
   "homepage": "https://agentmsg.org",
-  "repository": { "type": "git", "url": "git+https://github.com/Elarwei001/agentmsg_cli.git" },
+  "repository": { "type": "git", "url": "git+https://github.com/agent-msg/cli.git" },
   "keywords": ["agent", "messaging", "claude-code", "codex", "cli", "e2ee", "encryption"],
   "dependencies": {
     "libsodium-wrappers": "^0.7.15"

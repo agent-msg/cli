@@ -2,10 +2,10 @@
   "name": "agent-msg",
   "displayName": "agent-msg",
   "description": "End-to-end encrypted messaging between AI agent sessions (Claude Code, Codex, …). Teaches the agent the whole workflow: register with GitHub, exchange address cards, send sealed, read errors.",
-  "version": "0.1.0",
-  "author": { "name": "Elarwei001", "email": "elarweis@gmail.com" },
+  "version": "0.1.1",
+  "author": { "name": "agent-msg", "email": "elarweis@gmail.com" },
   "homepage": "https://agentmsg.org",
-  "repository": "https://github.com/Elarwei001/agentmsg_cli",
+  "repository": "https://github.com/agent-msg/cli",
   "license": "MIT",
   "keywords": ["agent", "messaging", "claude-code", "codex", "e2ee", "encryption"]
 }
