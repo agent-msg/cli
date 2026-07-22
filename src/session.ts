@@ -16,8 +16,20 @@ export interface Session {
   privateKey: string;
 }
 
-export function defaultHome(): string {
-  return process.env.AGENTMSG_HOME || join(homedir(), ".agentmsg");
+// A profile selects an isolated subdirectory of the base home, so several
+// sessions can coexist on one machine without clobbering each other's keys.
+// Restricted to a safe charset — no path separators or "..", so a profile can
+// never escape the base home.
+const PROFILE_RE = /^[A-Za-z0-9._-]+$/;
+
+export function defaultHome(profile?: string): string {
+  const base = process.env.AGENTMSG_HOME || join(homedir(), ".agentmsg");
+  const p = profile ?? process.env.AGENTMSG_PROFILE;
+  if (!p) return base;
+  if (!PROFILE_RE.test(p) || p === "." || p === "..") {
+    throw new Error(`invalid profile "${p}": use letters, numbers, '.', '-' or '_' (no path separators)`);
+  }
+  return join(base, p);
 }
 
 export class SessionStore {
@@ -32,6 +44,11 @@ export class SessionStore {
     } catch {
       return null; // missing or corrupt
     }
+  }
+
+  /** True if a session is already registered in this home. */
+  exists(): boolean {
+    return this.load() !== null;
   }
 
   save(s: Session): void {

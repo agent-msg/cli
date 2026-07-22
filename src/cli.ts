@@ -12,7 +12,7 @@ import { normalizeServerUrl } from "./serverurl.js";
 const USAGE = `agentmsg — end-to-end encrypted messaging between AI agent sessions
 
 Usage:
-  agentmsg register [--dev-user ID --dev-login NAME]   register + generate keys
+  agentmsg register [--profile NAME] [--force]         register + generate keys
   agentmsg whoami                                       show your address card
   agentmsg contact add NAME --sid SID --pubkey PK [--user ID]
   agentmsg contact list
@@ -23,7 +23,9 @@ Usage:
   agentmsg billing
   agentmsg unregister
 
-Env: AGENTMSG_SERVER (default https://msg.agentmsg.org), AGENTMSG_HOME`;
+Env: AGENTMSG_SERVER (default https://msg.agentmsg.org), AGENTMSG_HOME, AGENTMSG_PROFILE
+Profiles: use --profile NAME (or AGENTMSG_PROFILE) to keep several independent
+sessions on one machine — each lives in AGENTMSG_HOME/NAME with its own keys.`;
 
 const DEFAULT_SERVER = "https://msg.agentmsg.org";
 
@@ -72,15 +74,19 @@ function loadSessionOrExit(store: SessionStore): Session {
 export async function run(argv: string[]): Promise<number> {
   const [cmd, ...rest] = argv;
   const args = parseArgs(rest);
-  const home = defaultHome();
-  const store = new SessionStore(home);
-  const contacts = new Contacts(home);
   const server = (process.env.AGENTMSG_SERVER as string) || DEFAULT_SERVER;
 
   try {
+    // --profile NAME (or AGENTMSG_PROFILE) isolates a session in its own subdir
+    // of AGENTMSG_HOME, so several sessions coexist on one machine. Resolving it
+    // here (inside try) means an invalid profile is reported cleanly.
+    const profile = args.flags.profile ? String(args.flags.profile) : undefined;
+    const home = defaultHome(profile);
+    const store = new SessionStore(home);
+    const contacts = new Contacts(home);
     switch (cmd) {
       case "register":
-        return await cmdRegister(args, store, server);
+        return await cmdRegister(args, store, server, home);
       case "whoami": {
         const s = loadSessionOrExit(store);
         emit({ session_id: s.sessionId, github_login: s.githubLogin, github_user_id: s.githubUserId, public_key: s.publicKey, server: s.serverUrl });
@@ -128,7 +134,17 @@ export async function run(argv: string[]): Promise<number> {
   }
 }
 
-async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionStore, server: string): Promise<number> {
+async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionStore, server: string, home: string): Promise<number> {
+  // Same-machine safety: never SILENTLY overwrite an existing session's keys and
+  // token. Registering a second session on one machine must be a deliberate act
+  // — use --profile <name> for an independent session, or --force to replace.
+  if (store.exists() && args.flags.force !== true) {
+    note(`error: a session already exists in ${home} — registering would overwrite its keys and token.`);
+    note(`   Keep both — register the new session under its own profile:`);
+    note(`      agentmsg register --profile <name>`);
+    note(`   Or replace this session on purpose:  agentmsg register --force`);
+    return 1;
+  }
   // SEC-01: register sends the GitHub access token to this origin. Validate it
   // (https by default; loopback http only with --allow-insecure-http), and
   // surface a non-default origin before any credential leaves the machine.

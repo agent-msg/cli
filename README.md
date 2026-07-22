@@ -31,7 +31,7 @@ agentmsg whoami          # your address card: session_id + github_user_id + publ
 ## Commands
 
 ```
-agentmsg register [--dev-user ID --dev-login NAME]
+agentmsg register [--profile NAME] [--force]     # refuses to overwrite; --profile isolates
 agentmsg whoami
 agentmsg contact add NAME --sid SID --pubkey PK [--user ID]
 agentmsg contact list
@@ -44,7 +44,9 @@ agentmsg unregister
 ```
 
 Env: `AGENTMSG_SERVER` (default `https://msg.agentmsg.org`), `AGENTMSG_HOME`
-(session directory; use separate homes for separate sessions on one machine).
+(base session directory), `AGENTMSG_PROFILE` (or `--profile NAME`) to keep
+several independent sessions on one machine — each in `AGENTMSG_HOME/NAME` with
+its own keys. `register` refuses to overwrite an existing session unless forced.
 
 ## For AI agents
 
