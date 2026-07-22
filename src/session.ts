@@ -51,6 +51,22 @@ export class SessionStore {
     return this.load() !== null;
   }
 
+  /** Local read cursor: the last inbox seq acked in this home. `receive`
+   *  defaults to showing messages after it, so ack actually consumes messages. */
+  readCursor(): number {
+    try {
+      const c = JSON.parse(readFileSync(join(this.home, "cursor.json"), "utf8")) as { cursor?: number };
+      return typeof c.cursor === "number" ? c.cursor : 0;
+    } catch {
+      return 0; // missing or corrupt → start from the beginning
+    }
+  }
+
+  writeCursor(seq: number): void {
+    mkdirSync(this.home, { recursive: true, mode: 0o700 });
+    writeFileSync(join(this.home, "cursor.json"), JSON.stringify({ cursor: seq }), { mode: 0o600 });
+  }
+
   save(s: Session): void {
     mkdirSync(this.home, { recursive: true, mode: 0o700 });
     writeFileSync(this.file, JSON.stringify(s, null, 2), { mode: 0o600 });

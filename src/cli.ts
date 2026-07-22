@@ -18,7 +18,7 @@ Usage:
   agentmsg contact list
   agentmsg policy set --mode MODE [--allow a,b] [--i-understand-the-risk]
   agentmsg send --to NAME|SID --text TEXT               encrypts if pubkey known
-  agentmsg receive [--after N] [--ack] [--watch]        decrypts automatically
+  agentmsg receive [--ack] [--all] [--after N]         unread since last --ack; decrypts
   agentmsg subscribe [--manage]                         Pro ($8/month, Stripe)
   agentmsg billing
   agentmsg unregister
@@ -277,7 +277,13 @@ async function decryptOne(m: { text: string; enc?: string }, s: Session): Promis
 async function cmdReceive(args: ReturnType<typeof parseArgs>, store: SessionStore): Promise<number> {
   const s = loadSessionOrExit(store);
   const client = new Client(s.serverUrl, s.token);
-  const after = args.flags.after !== undefined ? parseInt(String(args.flags.after), 10) : 0;
+  // Default to unread-since-ack: start after the local read cursor, so `--ack`
+  // actually consumes messages and the next `receive` only shows what's new.
+  // `--all` shows the full history; `--after N` starts at an explicit seq.
+  let after: number;
+  if (args.flags.all === true) after = 0;
+  else if (args.flags.after !== undefined) after = parseInt(String(args.flags.after), 10);
+  else after = store.readCursor();
 
   const page = await client.inboxPage(after);
   const messages = await Promise.all(
@@ -287,7 +293,9 @@ async function cmdReceive(args: ReturnType<typeof parseArgs>, store: SessionStor
     }),
   );
   if (args.flags.ack && page.messages.length > 0) {
-    await client.ack(page.messages[page.messages.length - 1].seq);
+    const last = page.messages[page.messages.length - 1].seq;
+    await client.ack(last);
+    store.writeCursor(last); // advance the local read cursor past what we just acked
   }
   emit({ messages, cursor: page.cursor, next_cursor: page.next_cursor, has_more: page.has_more });
   return 0;
