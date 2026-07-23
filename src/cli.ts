@@ -2,12 +2,15 @@
 // agentmsg CLI. Encryption is the default: when the recipient's public key is
 // known (a saved contact), the message body is sealed on THIS machine before it
 // reaches the client, so the server only ever sees ciphertext.
-import { generateKeypair, seal, open } from "./crypto.js";
+import { generateKeypair, seal, open, sealBytes, openBytes } from "./crypto.js";
 import { Client, ApiError } from "./client.js";
 import { SessionStore, Session, defaultHome } from "./session.js";
 import { Contacts, fingerprint } from "./contacts.js";
 import { deviceFlowToken, DEFAULT_CLIENT_ID } from "./github.js";
 import { normalizeServerUrl } from "./serverurl.js";
+import { readFileSync, writeFileSync } from "node:fs";
+import { basename } from "node:path";
+import { createHash } from "node:crypto";
 
 const USAGE = `agentmsg — end-to-end encrypted messaging between AI agent sessions
 
@@ -17,7 +20,8 @@ Usage:
   agentmsg contact add NAME --sid SID --pubkey PK [--user ID]
   agentmsg contact list
   agentmsg policy set --mode MODE [--allow a,b] [--i-understand-the-risk]
-  agentmsg send --to NAME|SID --text TEXT               encrypts if pubkey known
+  agentmsg send --to NAME|SID --text TEXT [--file PATH] encrypts; --file attaches (Pro, E2EE)
+  agentmsg download --msg ID --file NAME [--out PATH]   download + decrypt an attachment
   agentmsg receive [--ack] [--all] [--after N]         unread since last --ack; decrypts
   agentmsg subscribe [--manage]                         Pro ($8/month, Stripe)
   agentmsg billing
@@ -31,10 +35,11 @@ const DEFAULT_SERVER = "https://msg.agentmsg.org";
 
 interface Args {
   _: string[];
-  flags: Record<string, string | boolean>;
+  flags: Record<string, string | boolean | string[]>;
 }
 
-// Minimal flag parser: --k v and --bool, plus positionals in `_`.
+// Minimal flag parser: --k v and --bool, plus positionals in `_`. A repeated
+// "--k v" (e.g. several --file) accumulates into a string[].
 function parseArgs(argv: string[]): Args {
   const out: Args = { _: [], flags: {} };
   for (let i = 0; i < argv.length; i++) {
@@ -43,7 +48,10 @@ function parseArgs(argv: string[]): Args {
       const key = a.slice(2);
       const next = argv[i + 1];
       if (next !== undefined && !next.startsWith("--")) {
-        out.flags[key] = next;
+        const cur = out.flags[key];
+        if (cur === undefined) out.flags[key] = next;
+        else if (Array.isArray(cur)) cur.push(next);
+        else out.flags[key] = [cur as string, next];
         i++;
       } else {
         out.flags[key] = true;
@@ -53,6 +61,12 @@ function parseArgs(argv: string[]): Args {
     }
   }
   return out;
+}
+
+// Normalize a flag value (undefined | string | boolean | string[]) to a string[].
+function flagList(v: string | boolean | string[] | undefined): string[] {
+  if (v === undefined || typeof v === "boolean") return [];
+  return Array.isArray(v) ? v : [v];
 }
 
 function emit(obj: unknown): void {
@@ -98,6 +112,8 @@ export async function run(argv: string[]): Promise<number> {
         return await cmdPolicy(args, store);
       case "send":
         return await cmdSend(args, store, contacts);
+      case "download":
+        return await cmdDownload(args, store);
       case "receive":
         return await cmdReceive(args, store);
       case "subscribe":
@@ -231,19 +247,30 @@ async function cmdPolicy(args: ReturnType<typeof parseArgs>, store: SessionStore
 async function cmdSend(args: ReturnType<typeof parseArgs>, store: SessionStore, contacts: Contacts): Promise<number> {
   const s = loadSessionOrExit(store);
   const to = String(args.flags.to || "");
-  const text = String(args.flags.text || "");
-  if (!to || !text) {
-    note("usage: agentmsg send --to NAME|SID --text TEXT");
+  const text = args.flags.text !== undefined ? String(args.flags.text) : "";
+  const files = flagList(args.flags.file);
+  if (!to || (!text && files.length === 0)) {
+    note("usage: agentmsg send --to NAME|SID --text TEXT [--file PATH ...]");
     return 2;
   }
   const addr = contacts.resolve(to)!;
   const pubkey = (args.flags["to-pubkey"] as string) || addr.publicKey;
   const client = new Client(s.serverUrl, s.token);
 
-  let resp;
+  // Attachments are ALWAYS end-to-end encrypted: without the recipient's public
+  // key we cannot seal them, and the server refuses plaintext attachments.
+  if (files.length > 0 && !pubkey) {
+    note(`error: no public key for "${to}" — attachments must be end-to-end encrypted.`);
+    note(`   Save the recipient's key: agentmsg contact add ${to} --sid <sid> --pubkey <pubkey>`);
+    return 1;
+  }
+
+  // Seal the body (or, text-only, send plaintext with explicit consent).
+  let body: string;
+  let enc: string | undefined;
   if (pubkey) {
-    const ct = await seal(text, pubkey); // encrypt on THIS machine
-    resp = await client.send({ to: addr.sessionId, text: ct, enc: "box1" });
+    body = await seal(text, pubkey); // encrypt on THIS machine
+    enc = "box1";
   } else {
     // SEC-04: fail closed. Without a public key we would send plaintext, which
     // an automated agent must never do by accident. Refuse unless the human
@@ -256,9 +283,66 @@ async function cmdSend(args: ReturnType<typeof parseArgs>, store: SessionStore, 
       return 1;
     }
     note(">> sending UNENCRYPTED (--plaintext)");
-    resp = await client.send({ to: addr.sessionId, text });
+    body = text;
+    enc = undefined;
   }
-  emit({ msg_id: resp.msg_id, seq: resp.seq, encrypted: !!pubkey });
+
+  // No attachments: single-shot send.
+  if (files.length === 0) {
+    const resp = await client.send({ to: addr.sessionId, text: body, enc });
+    emit({ msg_id: resp.msg_id, seq: resp.seq, encrypted: !!enc });
+    return 0;
+  }
+
+  // With attachments: seal each file locally, then two-phase upload. The bytes
+  // and sha256 we declare describe the CIPHERTEXT — the server stores an opaque
+  // blob it cannot read.
+  const sealed = await Promise.all(
+    files.map(async (p) => {
+      const ct = await sealBytes(readFileSync(p), pubkey!);
+      return { filename: basename(p), ct, sha256: createHash("sha256").update(ct).digest("hex") };
+    }),
+  );
+  const seen = new Set<string>();
+  for (const f of sealed) {
+    if (seen.has(f.filename)) {
+      note(`error: duplicate attachment filename "${f.filename}" — each attachment needs a distinct name.`);
+      return 1;
+    }
+    seen.add(f.filename);
+  }
+  const attachments = sealed.map((f) => ({ filename: f.filename, mime: "application/octet-stream", bytes: f.ct.length, sha256: f.sha256 }));
+  const resp = await client.send({ to: addr.sessionId, text: body, enc: "box1", attachments });
+  for (const u of resp.uploads || []) {
+    const f = sealed.find((x) => x.filename === u.filename);
+    if (!f) throw new Error(`server issued an upload ticket for an unknown file: ${u.filename}`);
+    await client.uploadPut(u.put_url, f.ct, "application/octet-stream");
+  }
+  const done = await client.commit(resp.msg_id);
+  emit({ msg_id: done.msg_id, seq: done.seq, encrypted: true, attachments: attachments.map((a) => a.filename) });
+  return 0;
+}
+
+async function cmdDownload(args: ReturnType<typeof parseArgs>, store: SessionStore): Promise<number> {
+  const s = loadSessionOrExit(store);
+  const msgID = String(args.flags.msg || "");
+  const filename = flagList(args.flags.file)[0] || "";
+  if (!msgID || !filename) {
+    note("usage: agentmsg download --msg MSG_ID --file FILENAME [--out PATH]");
+    return 2;
+  }
+  const client = new Client(s.serverUrl, s.token);
+  const ct = await client.download(`/v1/attachments/${encodeURIComponent(msgID)}/${encodeURIComponent(filename)}`);
+  let plain: Uint8Array;
+  try {
+    plain = await openBytes(ct, s.publicKey, s.privateKey); // decrypt on THIS machine
+  } catch {
+    note("error: could not decrypt attachment — it was not sealed to this session's key.");
+    return 1;
+  }
+  const out = args.flags.out ? String(args.flags.out) : filename;
+  writeFileSync(out, plain, { mode: 0o600 });
+  emit({ saved: out, bytes: plain.length });
   return 0;
 }
 

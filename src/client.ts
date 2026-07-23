@@ -61,10 +61,20 @@ export interface BillingResponse {
   current_period_end?: string;
 }
 
+/** Declared attachment metadata. Bytes/sha256 describe the CIPHERTEXT that will
+ *  be uploaded — the server never sees the plaintext. */
+export interface AttachmentDTO {
+  filename: string;
+  mime: string;
+  bytes: number;
+  sha256: string;
+}
+
 export interface SendInput {
   to: string;
   text: string;
   enc?: string;
+  attachments?: AttachmentDTO[];
 }
 
 import { normalizeServerUrl } from "./serverurl.js";
@@ -92,6 +102,27 @@ async function readCapped(resp: Response, max: number): Promise<string> {
     chunks.push(value);
   }
   return Buffer.concat(chunks).toString("utf8");
+}
+
+// Like readCapped but returns the raw bytes (for binary attachment downloads).
+async function readCappedBytes(resp: Response, max: number): Promise<Uint8Array> {
+  const cl = Number(resp.headers.get("content-length") || "");
+  if (Number.isFinite(cl) && cl > max) throw new ApiError(0, "response_too_large", `response exceeds ${max} bytes`);
+  if (!resp.body) return new Uint8Array(await resp.arrayBuffer());
+  const reader = resp.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) {
+      await reader.cancel();
+      throw new ApiError(0, "response_too_large", `response exceeds ${max} bytes`);
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks);
 }
 
 export class Client {
@@ -155,7 +186,64 @@ export class Client {
   send(input: SendInput): Promise<SendResponse> {
     const body: Record<string, unknown> = { to: input.to, text: input.text };
     if (input.enc) body.enc = input.enc;
+    if (input.attachments && input.attachments.length) body.attachments = input.attachments;
     return this.call("POST", "/v1/messages", body);
+  }
+
+  /** Finalize a pending message once every attachment has been uploaded. */
+  commit(msgID: string): Promise<{ msg_id: string; seq: number }> {
+    return this.call("POST", `/v1/messages/${encodeURIComponent(msgID)}/commit`);
+  }
+
+  /** PUT ciphertext bytes to a presigned upload URL (may be a different origin,
+   *  e.g. S3). No bearer token: the URL itself is the capability. */
+  async uploadPut(putUrl: string, body: Uint8Array, mime: string): Promise<void> {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), REQUEST_TIMEOUT_MS);
+    let resp: Response;
+    try {
+      resp = await fetch(putUrl, { method: "PUT", headers: { "Content-Type": mime }, body: body as unknown as BodyInit, signal: ctl.signal });
+    } catch (e) {
+      clearTimeout(timer);
+      if ((e as Error).name === "AbortError") throw new ApiError(0, "timeout", "attachment upload timed out");
+      throw e;
+    }
+    clearTimeout(timer);
+    if (!resp.ok) {
+      const raw = await readCapped(resp, MAX_RESPONSE_BYTES).catch(() => "");
+      throw new ApiError(resp.status, "upload_failed", `attachment upload failed (${resp.status}) ${raw}`);
+    }
+  }
+
+  /** Download an attachment (raw ciphertext bytes) through the server, with auth. */
+  async download(path: string): Promise<Uint8Array> {
+    const headers: Record<string, string> = {};
+    if (this.token) headers["Authorization"] = `Bearer ${this.token}`;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), REQUEST_TIMEOUT_MS);
+    let resp: Response;
+    try {
+      resp = await fetch(this.serverUrl + path, { method: "GET", headers, signal: ctl.signal });
+    } catch (e) {
+      clearTimeout(timer);
+      if ((e as Error).name === "AbortError") throw new ApiError(0, "timeout", `download ${path} timed out`);
+      throw e;
+    }
+    clearTimeout(timer);
+    if (!resp.ok) {
+      const raw = await readCapped(resp, MAX_RESPONSE_BYTES).catch(() => "");
+      let code = "http_error";
+      let msg = raw;
+      try {
+        const e = JSON.parse(raw) as ApiErrorBody;
+        code = e.error || code;
+        msg = e.message || e.error || raw;
+      } catch {
+        /* non-JSON error body */
+      }
+      throw new ApiError(resp.status, code, msg);
+    }
+    return readCappedBytes(resp, MAX_RESPONSE_BYTES);
   }
 
   inboxPage(after: number, limit = 0): Promise<InboxResponse> {
