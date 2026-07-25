@@ -3,8 +3,9 @@
 // leaves this file. One AGENTMSG_HOME = one session, so several homes on one
 // machine hold independent sessions (and independent keys).
 import { mkdirSync, readFileSync, writeFileSync, rmSync, chmodSync } from "node:fs";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 import { homedir } from "node:os";
+import { createHash, randomBytes } from "node:crypto";
 
 export interface Session {
   serverUrl: string;
@@ -22,11 +23,108 @@ export interface Session {
 // never escape the base home.
 const PROFILE_RE = /^[A-Za-z0-9._-]+$/;
 
+// Session-identifying env vars we have actually confirmed, in priority order.
+// AGENTMSG_SESSION comes first: it is the escape hatch ANY harness (or human)
+// can set when we cannot work the identity out ourselves.
+const AGENT_SESSION_ENV = ["AGENTMSG_SESSION", "CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID"];
+
+// Agent CLIs multiply faster than we can hard-code them, and the ones we checked
+// disagree on the noun — Codex calls a conversation a THREAD, not a SESSION. So
+// after the confirmed list we sniff for the shape, restricted to known agent
+// prefixes: a bare *_SESSION_ID would match iTerm and tmux, where a new terminal
+// tab is emphatically NOT a new identity.
+const AGENT_PREFIX = "(?:CLAUDE|CLAUDE_CODE|CODEX|CURSOR|OPENCLAW|AIDER|GEMINI|COPILOT|AMP|CLINE|WINDSURF|DEVIN|GOOSE|OPENHANDS)";
+const SNIFF_RE = new RegExp(`^${AGENT_PREFIX}_[A-Z0-9_]*(?:SESSION|THREAD|CONVERSATION)(?:_ID)?$`);
+
+// Two ways a name can match the shape but carry the wrong meaning:
+//   volatile — changes per request/capture, so it would mint a new identity on
+//     every command and demand a fresh register each time;
+//   flag — a boolean ABOUT the session rather than an id OF it. Claude Code's
+//     real CLAUDE_CODE_CHILD_SESSION=1 is exactly this, and trusting it would
+//     collapse every session onto one home again — the very bug being fixed.
+const VOLATILE_RE = /DEBUG|PROXY|TRACE|SPAN|REQUEST|CAPTURE|TMP|TEMP/;
+const FLAG_RE = /CHILD|PARENT|ENABLE|DISABLE|^IS_|_IS_|^HAS_|_HAS_|COUNT|INDEX/;
+
+// Belt and braces: whatever the name suggests, a boolean-ish or empty value is
+// not an identifier. Real session ids are uuids, hashes or slugs.
+const NOT_AN_ID_RE = /^(?:0|1|true|false|yes|no|on|off|none|null|undefined)$/i;
+
+function looksLikeSessionId(v: string | undefined): v is string {
+  const t = v?.trim();
+  return !!t && t.length >= 3 && !NOT_AN_ID_RE.test(t);
+}
+
+// Markers that mean "a child process of some agent", without identifying which
+// session. Enough to know isolation MATTERS here even when we cannot do it.
+const AGENT_MARKER_ENV: Array<[string, string]> = [
+  ["CLAUDECODE", "Claude Code"],
+  ["CLAUDE_CODE_ENTRYPOINT", "Claude Code"],
+  ["OPENCLAW_CLI", "openclaw"],
+  ["OPENCLAW_SHELL", "openclaw"],
+  ["CODEX_SANDBOX", "Codex"],
+  ["CODEX_THREAD_ID", "Codex"],
+  ["CURSOR_AGENT", "Cursor"],
+  ["AI_AGENT", "an AI agent"],
+];
+
+/** The env var naming THIS agent session, or undefined if none does. */
+function agentSessionVar(): string | undefined {
+  for (const k of AGENT_SESSION_ENV) {
+    if (looksLikeSessionId(process.env[k])) return k;
+  }
+  // Deterministic order: several matches must always resolve the same way.
+  return Object.keys(process.env)
+    .filter((k) => SNIFF_RE.test(k) && !VOLATILE_RE.test(k) && !FLAG_RE.test(k) && looksLikeSessionId(process.env[k]))
+    .sort()[0];
+}
+
+/**
+ * The profile implied by the agent session we are running inside, or undefined
+ * when we cannot tell (a plain human shell — or an agent like openclaw that
+ * spawns children without passing its session id down).
+ *
+ * Without this, every agent session on a machine shares ~/.agentmsg: they all
+ * report the SAME address card, and they poll one inbox — so `receive --ack` in
+ * one session silently consumes another's messages. Hashing keeps the value a
+ * safe path segment whatever the harness put in the variable.
+ */
+export function agentSessionProfile(): string | undefined {
+  const k = agentSessionVar();
+  if (!k) return undefined;
+  return "s-" + createHash("sha256").update(process.env[k]!.trim()).digest("hex").slice(0, 12);
+}
+
+/**
+ * The agent runtime we appear to be running inside, or undefined for a plain
+ * human shell. Used to tell "no isolation needed" apart from "isolation needed
+ * but impossible" — the latter deserves a loud error rather than silent sharing.
+ */
+export function detectAgentRuntime(): string | undefined {
+  for (const [k, name] of AGENT_MARKER_ENV) {
+    if (process.env[k]?.trim()) return name;
+  }
+  return agentSessionVar() ? "an AI agent" : undefined;
+}
+
+/** A distinct, pasteable identity for a human to pin this session with. */
+export function suggestedSessionName(): string {
+  return `${basename(process.cwd()).replace(/[^A-Za-z0-9._-]/g, "") || "agent"}-${randomBytes(3).toString("hex")}`;
+}
+
+/** The base home, before any profile subdirectory is applied. */
+export function baseHome(): string {
+  return process.env.AGENTMSG_HOME || join(homedir(), ".agentmsg");
+}
+
 export function defaultHome(profile?: string): string {
-  const base = process.env.AGENTMSG_HOME || join(homedir(), ".agentmsg");
-  const p = profile ?? process.env.AGENTMSG_PROFILE;
+  const base = baseHome();
+  // Precedence: --profile > AGENTMSG_PROFILE > the enclosing agent session.
+  // "." is the explicit opt-out — it means "the one shared machine identity".
+  const explicit = profile ?? process.env.AGENTMSG_PROFILE;
+  if (explicit === "." ) return base;
+  const p = explicit ?? agentSessionProfile();
   if (!p) return base;
-  if (!PROFILE_RE.test(p) || p === "." || p === "..") {
+  if (!PROFILE_RE.test(p) || p === "..") {
     throw new Error(`invalid profile "${p}": use letters, numbers, '.', '-' or '_' (no path separators)`);
   }
   return join(base, p);

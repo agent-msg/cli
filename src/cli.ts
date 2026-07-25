@@ -4,7 +4,7 @@
 // reaches the client, so the server only ever sees ciphertext.
 import { generateKeypair, seal, open, sealBytes, openBytes } from "./crypto.js";
 import { Client, ApiError } from "./client.js";
-import { SessionStore, Session, defaultHome } from "./session.js";
+import { SessionStore, Session, defaultHome, baseHome, detectAgentRuntime, agentSessionProfile, suggestedSessionName } from "./session.js";
 import { Contacts, fingerprint } from "./contacts.js";
 import { deviceFlowToken, DEFAULT_CLIENT_ID } from "./github.js";
 import { normalizeServerUrl } from "./serverurl.js";
@@ -27,9 +27,11 @@ Usage:
   agentmsg billing
   agentmsg unregister
 
-Env: AGENTMSG_SERVER (default https://msg.agentmsg.org), AGENTMSG_HOME, AGENTMSG_PROFILE
-Profiles: use --profile NAME (or AGENTMSG_PROFILE) to keep several independent
-sessions on one machine — each lives in AGENTMSG_HOME/NAME with its own keys.`;
+Env: AGENTMSG_SERVER (default https://msg.agentmsg.org; read only by 'register' —
+other commands use the server saved in the session), AGENTMSG_HOME, AGENTMSG_PROFILE
+Profiles: inside an agent session a profile is derived automatically, so each
+session has its own card and inbox. --profile NAME (or AGENTMSG_PROFILE) picks one
+explicitly; AGENTMSG_PROFILE=. means the single shared machine identity.`;
 
 const DEFAULT_SERVER = "https://msg.agentmsg.org";
 
@@ -76,10 +78,19 @@ function note(msg: string): void {
   process.stderr.write(msg + "\n");
 }
 
-function loadSessionOrExit(store: SessionStore): Session {
+function loadSessionOrExit(store: SessionStore, home?: string): Session {
   const s = store.load();
   if (!s) {
     note("no active session; run 'agentmsg register' first");
+    // This session got its own home (auto-derived from the agent session it runs
+    // in). If a session predating that isolation sits in the shared base home,
+    // it is not gone — it just isn't ours. Say where it is and how to adopt it.
+    const base = baseHome();
+    if (home && home !== base && new SessionStore(base).exists()) {
+      note(`   note: this agent session uses its own home (${home}), so sessions no longer collide.`);
+      note(`   An existing shared session is in ${base} — to use that one instead:`);
+      note(`      export AGENTMSG_PROFILE=.`);
+    }
     process.exit(1);
   }
   return s;
@@ -102,29 +113,30 @@ export async function run(argv: string[]): Promise<number> {
       case "register":
         return await cmdRegister(args, store, server, home);
       case "whoami": {
-        const s = loadSessionOrExit(store);
-        emit({ session_id: s.sessionId, github_login: s.githubLogin, github_user_id: s.githubUserId, public_key: s.publicKey, server: s.serverUrl });
+        const s = loadSessionOrExit(store, home);
+        // `home` disambiguates cards when several agent sessions share a machine.
+        emit({ session_id: s.sessionId, github_login: s.githubLogin, github_user_id: s.githubUserId, public_key: s.publicKey, server: s.serverUrl, home });
         return 0;
       }
       case "contact":
         return cmdContact(args, contacts);
       case "policy":
-        return await cmdPolicy(args, store);
+        return await cmdPolicy(args, store, home);
       case "send":
-        return await cmdSend(args, store, contacts);
+        return await cmdSend(args, store, contacts, home);
       case "download":
-        return await cmdDownload(args, store);
+        return await cmdDownload(args, store, home);
       case "receive":
-        return await cmdReceive(args, store);
+        return await cmdReceive(args, store, home);
       case "subscribe":
-        return await cmdSubscribe(args, store);
+        return await cmdSubscribe(args, store, home);
       case "billing": {
-        const s = loadSessionOrExit(store);
+        const s = loadSessionOrExit(store, home);
         emit(await new Client(s.serverUrl, s.token).billing());
         return 0;
       }
       case "unregister": {
-        const s = loadSessionOrExit(store);
+        const s = loadSessionOrExit(store, home);
         await new Client(s.serverUrl, s.token).unregister();
         store.clear();
         emit({ status: "unregistered" });
@@ -159,6 +171,23 @@ async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionSto
     note(`   Keep both — register the new session under its own profile:`);
     note(`      agentmsg register --profile <name>`);
     note(`   Or replace this session on purpose:  agentmsg register --force`);
+    return 1;
+  }
+  // Some agents (openclaw, and any harness that spawns children without passing
+  // its session id down) leave us able to detect that we are inside an agent but
+  // unable to tell WHICH session. Minting an identity anyway would put every
+  // session back on one card and one inbox — the exact bug isolation fixes, only
+  // now invisible. Stop, and hand the human a value they can paste.
+  const runtime = detectAgentRuntime();
+  if (runtime && !agentSessionProfile() && !args.flags.profile && !process.env.AGENTMSG_PROFILE) {
+    const suggestion = suggestedSessionName();
+    note(`error: running inside ${runtime}, which does not expose a session id — cannot isolate this session automatically.`);
+    note(`   Registering now would share one address card and one inbox with every other session here,`);
+    note(`   so 'receive --ack' in one would consume another's messages.`);
+    note(`   Give this session an identity, then re-run register:`);
+    note(`      export AGENTMSG_SESSION=${suggestion}`);
+    note(`   (any value unique to this session works; --profile <name> does the same)`);
+    note(`   Deliberately sharing one identity machine-wide:  export AGENTMSG_PROFILE=.`);
     return 1;
   }
   // SEC-01: register sends the GitHub access token to this origin. Validate it
@@ -230,12 +259,12 @@ function cmdContact(args: ReturnType<typeof parseArgs>, contacts: Contacts): num
   return 2;
 }
 
-async function cmdPolicy(args: ReturnType<typeof parseArgs>, store: SessionStore): Promise<number> {
+async function cmdPolicy(args: ReturnType<typeof parseArgs>, store: SessionStore, home?: string): Promise<number> {
   if (args._[0] !== "set") {
     note("usage: agentmsg policy set --mode MODE [--allow a,b] [--i-understand-the-risk]");
     return 2;
   }
-  const s = loadSessionOrExit(store);
+  const s = loadSessionOrExit(store, home);
   const mode = String(args.flags.mode || "");
   const allow = args.flags.allow ? String(args.flags.allow).split(",").map((x) => x.trim()).filter(Boolean) : [];
   const ackRisk = args.flags["i-understand-the-risk"] === true;
@@ -244,8 +273,8 @@ async function cmdPolicy(args: ReturnType<typeof parseArgs>, store: SessionStore
   return 0;
 }
 
-async function cmdSend(args: ReturnType<typeof parseArgs>, store: SessionStore, contacts: Contacts): Promise<number> {
-  const s = loadSessionOrExit(store);
+async function cmdSend(args: ReturnType<typeof parseArgs>, store: SessionStore, contacts: Contacts, home?: string): Promise<number> {
+  const s = loadSessionOrExit(store, home);
   const to = String(args.flags.to || "");
   const text = args.flags.text !== undefined ? String(args.flags.text) : "";
   const files = flagList(args.flags.file);
@@ -323,8 +352,8 @@ async function cmdSend(args: ReturnType<typeof parseArgs>, store: SessionStore, 
   return 0;
 }
 
-async function cmdDownload(args: ReturnType<typeof parseArgs>, store: SessionStore): Promise<number> {
-  const s = loadSessionOrExit(store);
+async function cmdDownload(args: ReturnType<typeof parseArgs>, store: SessionStore, home?: string): Promise<number> {
+  const s = loadSessionOrExit(store, home);
   const msgID = String(args.flags.msg || "");
   const filename = flagList(args.flags.file)[0] || "";
   if (!msgID || !filename) {
@@ -358,8 +387,8 @@ async function decryptOne(m: { text: string; enc?: string }, s: Session): Promis
   }
 }
 
-async function cmdReceive(args: ReturnType<typeof parseArgs>, store: SessionStore): Promise<number> {
-  const s = loadSessionOrExit(store);
+async function cmdReceive(args: ReturnType<typeof parseArgs>, store: SessionStore, home?: string): Promise<number> {
+  const s = loadSessionOrExit(store, home);
   const client = new Client(s.serverUrl, s.token);
   // Default to unread-since-ack: start after the local read cursor, so `--ack`
   // actually consumes messages and the next `receive` only shows what's new.
@@ -385,8 +414,8 @@ async function cmdReceive(args: ReturnType<typeof parseArgs>, store: SessionStor
   return 0;
 }
 
-async function cmdSubscribe(args: ReturnType<typeof parseArgs>, store: SessionStore): Promise<number> {
-  const s = loadSessionOrExit(store);
+async function cmdSubscribe(args: ReturnType<typeof parseArgs>, store: SessionStore, home?: string): Promise<number> {
+  const s = loadSessionOrExit(store, home);
   const client = new Client(s.serverUrl, s.token);
   const { url } = args.flags.manage ? await client.portal() : await client.checkout();
   note(">> open this URL in a browser to continue:");
