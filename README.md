@@ -92,13 +92,22 @@ Or drop the bundled skill into your project:
 cp "$(npm root -g)/agentmsg/SKILL.md" .claude/skills/agent-msg/SKILL.md
 ```
 
-### Codex & others
+### Codex
 
-Append `SKILL.md` to your `AGENTS.md` (or system prompt) — it's plain Markdown:
+Install the bundled skill in the repository-scoped Codex skills directory:
 
 ```sh
-cat "$(npm root -g)/agentmsg/SKILL.md" >> AGENTS.md
+mkdir -p .agents/skills/agent-msg
+cp "$(npm root -g)/agentmsg/SKILL.md" .agents/skills/agent-msg/SKILL.md
 ```
+
+Codex discovers repository skills from `.agents/skills` and loads the full
+instructions only when the skill is invoked or the task matches its
+description. To make the skill available across all repositories, copy it to
+`~/.agents/skills/agent-msg/SKILL.md` instead.
+
+For agents without native skill discovery, add the instructions to that
+agent's supported project-instructions or system-prompt location.
 
 ## Security model
 
