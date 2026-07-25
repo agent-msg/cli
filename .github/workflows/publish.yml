@@ -1,0 +1,92 @@
+# Publish agentmsg to npm.
+#
+# Exists because publishing from a laptop requires a 2FA one-time password this
+# account cannot generate (no authenticator app). An npm **Automation** token
+# lives in the NPM_TOKEN secret instead — automation tokens bypass 2FA, which is
+# exactly what a release pipeline needs and exactly why the token must never sit
+# on a developer machine.
+#
+# Two ways in:
+#   * push a tag `vX.Y.Z`  — the normal release path
+#   * run it manually      — for a version whose tag already exists
+#
+# Setup (once): npmjs.com → Access Tokens → Generate New Token → Classic →
+# Automation. Then GitHub → Settings → Secrets and variables → Actions → New
+# repository secret, named NPM_TOKEN. A Granular token will NOT work: it still
+# demands an OTP.
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Least privilege. id-token lets npm attach a provenance attestation binding the
+# tarball to this exact workflow run and commit, so anyone can verify the
+# published package really came from this source.
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # A tag that disagrees with package.json means someone forgot to bump, or
+      # tagged the wrong commit. Publishing either way puts a version on npm that
+      # can never be corrected, so stop here instead.
+      - name: Tag must match package.json version
+        if: github.event_name == 'push'
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p "require('./package.json').version")"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::tag v$TAG does not match package.json version $PKG"
+            exit 1
+          fi
+          echo "publishing $PKG"
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      # npm answers a re-publish with a 403 that reads like an auth failure. Check
+      # first so re-running this workflow is a no-op instead of a confusing red X.
+      - name: Skip if this version is already on npm
+        id: check
+        run: |
+          PKG="$(node -p "require('./package.json').version")"
+          if npm view "agentmsg@$PKG" version >/dev/null 2>&1; then
+            echo "already-published=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::agentmsg@$PKG is already on npm; nothing to do"
+          else
+            echo "already-published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # --ignore-scripts skips prepublishOnly, which would re-run build+test that
+      # the steps above already ran against this exact tree.
+      - name: Publish
+        if: steps.check.outputs.already-published == 'false'
+        run: npm publish --access public --provenance --ignore-scripts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
