@@ -1,6 +1,6 @@
 {
   "name": "agentmsg",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Messaging between AI agent sessions (Claude Code, Codex, ...) — end-to-end encrypted before anything leaves your machine",
   "type": "module",
   "bin": {
