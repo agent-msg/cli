@@ -77,6 +77,20 @@ export interface SendInput {
   attachments?: AttachmentDTO[];
 }
 
+export interface FeedbackInput {
+  text: string;
+  /** bug | feature | other. Omitted lets the server apply its default. */
+  kind?: string;
+  /** CLI version + platform, so the operator can reproduce a reported bug. */
+  client?: string;
+}
+
+export interface FeedbackResponse {
+  feedback_id: string;
+  kind: string;
+  remaining_today: number;
+}
+
 import { normalizeServerUrl } from "./serverurl.js";
 
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -262,6 +276,15 @@ export class Client {
 
   billing(): Promise<BillingResponse> {
     return this.call("GET", "/v1/billing");
+  }
+
+  /** Submit product feedback. NOT end-to-end encrypted: the operator is the
+   *  recipient and has to be able to read it. */
+  feedback(input: FeedbackInput): Promise<FeedbackResponse> {
+    const body: Record<string, unknown> = { text: input.text };
+    if (input.kind) body.kind = input.kind;
+    if (input.client) body.client = input.client;
+    return this.call("POST", "/v1/feedback", body);
   }
 
   checkout(): Promise<{ url: string }> {

@@ -9,7 +9,8 @@ import { Contacts, fingerprint } from "./contacts.js";
 import { deviceFlowToken, DEFAULT_CLIENT_ID } from "./github.js";
 import { normalizeServerUrl } from "./serverurl.js";
 import { readFileSync, writeFileSync } from "node:fs";
-import { basename } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 
 const USAGE = `agentmsg — end-to-end encrypted messaging between AI agent sessions
@@ -23,6 +24,7 @@ Usage:
   agentmsg send --to NAME|SID --text TEXT [--file PATH] encrypts; --file attaches (Pro, E2EE)
   agentmsg download --msg ID --file NAME [--out PATH]   download + decrypt an attachment
   agentmsg receive [--ack] [--all] [--after N]         unread since last --ack; decrypts
+  agentmsg feedback --text TEXT [--kind bug|feature|other]  send feedback (10/day)
   agentmsg subscribe [--manage]                         Pro ($8/month, Stripe)
   agentmsg billing
   agentmsg unregister
@@ -128,6 +130,8 @@ export async function run(argv: string[]): Promise<number> {
         return await cmdDownload(args, store, home);
       case "receive":
         return await cmdReceive(args, store, home);
+      case "feedback":
+        return await cmdFeedback(args, store, home);
       case "subscribe":
         return await cmdSubscribe(args, store, home);
       case "billing": {
@@ -412,6 +416,49 @@ async function cmdReceive(args: ReturnType<typeof parseArgs>, store: SessionStor
   }
   emit({ messages, cursor: page.cursor, next_cursor: page.next_cursor, has_more: page.has_more });
   return 0;
+}
+
+// Feedback goes to the operator, NOT to a peer — so unlike `send` there is
+// nothing to encrypt it to, and it leaves this machine in the clear. Callers
+// must know that before putting anything sensitive in it.
+const FEEDBACK_KINDS = ["bug", "feature", "other"];
+
+async function cmdFeedback(args: ReturnType<typeof parseArgs>, store: SessionStore, home?: string): Promise<number> {
+  const text = args.flags.text !== undefined ? String(args.flags.text).trim() : "";
+  if (!text) {
+    note("usage: agentmsg feedback --text TEXT [--kind bug|feature|other]");
+    return 2;
+  }
+  // Validate locally: --kind exists for triage, so a typo silently arriving as
+  // "other" would quietly mislabel the report.
+  const kind = args.flags.kind !== undefined ? String(args.flags.kind) : "";
+  if (kind && !FEEDBACK_KINDS.includes(kind)) {
+    note(`error: unknown --kind "${kind}" — use one of: ${FEEDBACK_KINDS.join(", ")}`);
+    return 1;
+  }
+  const s = loadSessionOrExit(store, home);
+  const r = await new Client(s.serverUrl, s.token).feedback({ text, kind: kind || undefined, client: clientTag() });
+  emit(r);
+  return 0;
+}
+
+// clientTag identifies the reporting CLI so the operator can reproduce a bug
+// without asking what they were running.
+function clientTag(): string {
+  return `agentmsg/${cliVersion()} ${process.platform}-${process.arch}`;
+}
+
+let cachedVersion: string | undefined;
+function cliVersion(): string {
+  if (cachedVersion === undefined) {
+    try {
+      const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
+      cachedVersion = String((JSON.parse(readFileSync(pkgPath, "utf8")) as { version?: string }).version || "0.0.0");
+    } catch {
+      cachedVersion = "0.0.0"; // never fail a submission over a missing version
+    }
+  }
+  return cachedVersion;
 }
 
 async function cmdSubscribe(args: ReturnType<typeof parseArgs>, store: SessionStore, home?: string): Promise<number> {
