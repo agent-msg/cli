@@ -75,13 +75,15 @@ function assertGuestResult(result: GuestRegistrationResponse, card: AddressCard,
     result.session_id !== card.session_id ||
     result.principal_id !== card.principal_id ||
     result.installation_id !== card.installation_id ||
+    result.address_card?.version !== card.version ||
+    result.address_card?.service !== card.service ||
     result.address_card?.identity_type !== card.identity_type ||
     result.address_card?.principal_id !== card.principal_id ||
     result.address_card?.installation_id !== card.installation_id ||
     result.address_card?.session_id !== card.session_id ||
     result.address_card?.verified !== card.verified ||
     result.address_card?.public_key !== card.public_key ||
-    result.address_card?.expires_at !== card.expires_at ||
+    (result.address_card?.expires_at || undefined) !== card.expires_at ||
     result.address_card?.signature !== signature
   ) {
     throw new Error("Guest registration response binding mismatch");
@@ -98,11 +100,14 @@ function assertVerifiedResult(result: VerifiedRegistrationResponse, card: Addres
     result.installation_id !== card.installation_id ||
     result.github_user_id !== card.github_user_id ||
     result.github_login !== card.github_login ||
+    result.address_card?.version !== card.version ||
+    result.address_card?.service !== card.service ||
     result.address_card?.identity_type !== card.identity_type ||
     result.address_card?.principal_id !== card.principal_id ||
     result.address_card?.installation_id !== card.installation_id ||
     result.address_card?.session_id !== card.session_id ||
     result.address_card?.verified !== card.verified ||
+    (result.address_card?.expires_at || undefined) !== card.expires_at ||
     result.address_card?.public_key !== card.public_key ||
     result.address_card?.github_user_id !== card.github_user_id ||
     result.address_card?.github_login !== card.github_login ||

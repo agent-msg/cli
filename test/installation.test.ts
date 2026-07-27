@@ -17,8 +17,10 @@ describe("installation identity storage", () => {
     const second = new InstallationStore(home).loadOrCreate();
     expect(second.publicKey).toBe(first.publicKey);
     expect(second.seed.equals(first.seed)).toBe(true);
-    expect(lstatSync(join(home, "installation.key")).mode & 0o777).toBe(0o600);
-    expect(lstatSync(join(home, "installation.json")).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32") {
+      expect(lstatSync(join(home, "installation.key")).mode & 0o777).toBe(0o600);
+      expect(lstatSync(join(home, "installation.json")).mode & 0o777).toBe(0o600);
+    }
     expect(readFileSync(join(home, "installation.key"), "utf8")).not.toContain(first.publicKey);
   });
 

@@ -33,7 +33,7 @@ describe("SessionStore", () => {
     expect(s.load()).toEqual(sample);
   });
 
-  it("writes the session file with owner-only permissions (0600)", () => {
+  it.skipIf(process.platform === "win32")("writes the session file with owner-only permissions (0600)", () => {
     const s = new SessionStore(home);
     s.save(sample);
     const mode = statSync(join(home, "session.json")).mode & 0o777;

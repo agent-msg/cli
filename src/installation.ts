@@ -66,6 +66,46 @@ function ensureSecureHome(home: string): void {
   } else {
     mkdirSync(home, { recursive: true, mode: 0o700 });
   }
+  if (process.platform === "win32") hardenWindowsDirectory(home);
+}
+
+function runPowerShell(script: string, path: string): boolean {
+  const result = spawnSync(
+    "powershell.exe",
+    ["-NoProfile", "-NonInteractive", "-Command", script, path],
+    { encoding: "utf8", timeout: 10_000, windowsHide: true, stdio: ["ignore", "ignore", "ignore"] },
+  );
+  return result.status === 0;
+}
+
+function hardenWindowsDirectory(path: string): void {
+  const script = [
+    "$p=$args[0]",
+    "$me=[Security.Principal.WindowsIdentity]::GetCurrent().Name",
+    "$acl=Get-Acl -LiteralPath $p",
+    "$acl.SetAccessRuleProtection($true,$false)",
+    "foreach($r in @($acl.Access)){$acl.RemoveAccessRuleAll($r)}",
+    "$rule=New-Object Security.AccessControl.FileSystemAccessRule($me,'FullControl','ContainerInherit,ObjectInherit','None','Allow')",
+    "$acl.SetAccessRule($rule)",
+    "Set-Acl -LiteralPath $p -AclObject $acl",
+  ].join(";");
+  if (!runPowerShell(script, path)) {
+    throw new Error("could not restrict AGENTMSG_HOME to the current Windows user");
+  }
+}
+
+function validateWindowsPrivateFile(path: string): void {
+  const script = [
+    "$p=$args[0]",
+    "$me=[Security.Principal.WindowsIdentity]::GetCurrent().Name",
+    "$acl=Get-Acl -LiteralPath $p",
+    "if($acl.Owner -ne $me){exit 2}",
+    "$bad=@($acl.Access | Where-Object {$_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -ne $me})",
+    "if($bad.Count -ne 0){exit 3}",
+  ].join(";");
+  if (!runPowerShell(script, path)) {
+    throw new Error("installation key Windows ACL or owner is unsafe");
+  }
 }
 
 export function atomicWritePrivate(path: string, data: string | Buffer): void {
@@ -104,9 +144,13 @@ export function atomicWritePrivate(path: string, data: string | Buffer): void {
 function readSecureSeed(path: string): Buffer {
   const st = lstatSync(path);
   if (st.isSymbolicLink() || !st.isFile()) throw new Error("installation key must be a regular file");
-  if ((st.mode & 0o077) !== 0) throw new Error("installation key permissions must be 0600");
-  if (typeof process.getuid === "function" && st.uid !== process.getuid()) {
-    throw new Error("installation key is owned by another user");
+  if (process.platform === "win32") {
+    validateWindowsPrivateFile(path);
+  } else {
+    if ((st.mode & 0o077) !== 0) throw new Error("installation key permissions must be 0600");
+    if (typeof process.getuid === "function" && st.uid !== process.getuid()) {
+      throw new Error("installation key is owned by another user");
+    }
   }
   const seed = Buffer.from(readFileSync(path, "utf8").trim(), "base64url");
   if (seed.length !== 32) throw new Error("installation key file is corrupt");

@@ -25,3 +25,74 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
+
+  go-server-integration:
+    strategy:
+      fail-fast: false
+      matrix:
+        tier: [low, medium, high]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: cli
+      - uses: actions/checkout@v4
+        with:
+          repository: Elarwei001/agent-msg
+          ref: codex/guest-risk-admission
+          path: server
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: cli/package-lock.json
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+      - name: Build CLI
+        working-directory: cli
+        run: npm ci && npm run build
+      - name: Run against real Go server
+        shell: bash
+        env:
+          PORT: "18080"
+          AUTH_MODE: dev
+          STORE_MODE: mem
+          BLOB_MODE: fake
+          MODERATION_MODE: rules
+          GUEST_REGISTRATION_MODE: rules
+          GUEST_SERVER_ORIGIN: http://127.0.0.1:18080
+          GUEST_TOKEN_KEY: 0123456789abcdef0123456789abcdef
+          GITHUB_CLIENT_ID: test-client
+          GUEST_POW_DIFFICULTY_BITS: "4"
+        run: |
+          case "${{ matrix.tier }}" in
+            low)
+              export GUEST_LOW_RISK_CIDRS=127.0.0.1/32
+              export GUEST_MEDIUM_RISK_CIDRS=198.51.100.0/24
+              export AGENTMSG_GO_EXPECTED_IDENTITY=guest
+              ;;
+            medium)
+              export GUEST_LOW_RISK_CIDRS=192.0.2.0/24
+              export GUEST_MEDIUM_RISK_CIDRS=127.0.0.1/32
+              export AGENTMSG_GO_EXPECTED_IDENTITY=guest
+              ;;
+            high)
+              export GUEST_LOW_RISK_CIDRS=192.0.2.0/24
+              export GUEST_MEDIUM_RISK_CIDRS=198.51.100.0/24
+              export AGENTMSG_GO_EXPECTED_IDENTITY=github
+              ;;
+          esac
+          log_path="$GITHUB_WORKSPACE/server.log"
+          (cd server && go run ./cmd/server) >"$log_path" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid"; cat "$log_path"' EXIT
+          for _ in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:18080/v1/version >/dev/null && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:18080/v1/version >/dev/null
+          export AGENTMSG_GO_SERVER=http://127.0.0.1:18080
+          cd cli
+          npm test -- --run test/go-server.integration.test.ts

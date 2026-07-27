@@ -119,4 +119,35 @@ describe("Guest-first registration orchestration", () => {
       registerGuestFirst({ client, installation, serverOrigin: origin, note: () => undefined }),
     ).rejects.toThrow(/flow id/);
   });
+
+  it("rejects a response card whose signed service field was changed", async () => {
+    const ch = challenge();
+    const client = {
+      guestChallenge: vi.fn(async () => ch),
+      guestRegistration: vi.fn(async (input: Record<string, unknown>) => ({
+        session_id: ch.session_id,
+        token: "guest-token",
+        principal_id: ch.principal_id,
+        installation_id: ch.installation_id,
+        identity_type: "guest" as const,
+        verified: false as const,
+        expires_at: ch.guest_expires_at,
+        address_card: {
+          version: 1,
+          service: "https://tampered.example",
+          identity_type: "guest" as const,
+          principal_id: ch.principal_id,
+          installation_id: ch.installation_id,
+          session_id: ch.session_id,
+          verified: false,
+          expires_at: ch.guest_expires_at,
+          public_key: installation.publicKey,
+          signature: String(input.address_card_signature),
+        },
+      })),
+    } as unknown as Client;
+    await expect(
+      registerGuestFirst({ client, installation, serverOrigin: origin, note: () => undefined }),
+    ).rejects.toThrow(/response binding mismatch/);
+  });
 });
