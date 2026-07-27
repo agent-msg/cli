@@ -89,7 +89,7 @@ function hardenWindowsDirectory(path: string): void {
 
 function validateWindowsPrivateFile(path: string): void {
   const script = [
-    "$p=$args[0]",
+    "$p=$env:AGENTMSG_ACL_PATH",
     "$me=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
     "$allowed=@($me,'S-1-5-18','S-1-5-32-544')",
     "$acl=Get-Acl -LiteralPath $p",
@@ -101,8 +101,14 @@ function validateWindowsPrivateFile(path: string): void {
   ].join(";");
   const result = spawnSync(
     "powershell.exe",
-    ["-NoProfile", "-NonInteractive", "-Command", script, path],
-    { encoding: "utf8", timeout: 10_000, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] },
+    ["-NoProfile", "-NonInteractive", "-Command", script],
+    {
+      encoding: "utf8",
+      timeout: 10_000,
+      windowsHide: true,
+      env: { ...process.env, AGENTMSG_ACL_PATH: path },
+      stdio: ["ignore", "pipe", "ignore"],
+    },
   );
   if (result.status !== 0) {
     const detail = result.stdout.trim().replace(/\s+/g, " ");
