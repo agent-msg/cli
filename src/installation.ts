@@ -100,10 +100,11 @@ function validateWindowsPrivateFile(path: string): void {
   const script = [
     "$p=$args[0]",
     "$me=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+    "$allowed=@($me,'S-1-5-18','S-1-5-32-544')",
     "$acl=Get-Acl -LiteralPath $p",
     "$owner=(New-Object Security.Principal.NTAccount($acl.Owner)).Translate([Security.Principal.SecurityIdentifier]).Value",
-    "if($owner -ne $me){exit 2}",
-    "$bad=@($acl.Access | Where-Object {$_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -ne $me})",
+    "if($allowed -notcontains $owner){exit 2}",
+    "$bad=@($acl.Access | Where-Object {$_.AccessControlType -eq 'Allow' -and $allowed -notcontains $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value})",
     "if($bad.Count -ne 0){exit 3}",
   ].join(";");
   if (!runPowerShell(script, path)) {
