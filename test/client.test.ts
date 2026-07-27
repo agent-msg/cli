@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import { createServer, Server, IncomingMessage, ServerResponse } from "node:http";
 import { Client, ApiError } from "../src/client.js";
 
@@ -85,6 +85,34 @@ describe("Client", () => {
     await c.setPolicy("git_user", ["42"], false);
     expect(last.method).toBe("PUT");
     expect(last.body).toEqual({ mode: "git_user", allow: ["42"], i_understand_the_risk: false });
+  });
+
+  it("retries an ambiguous registration with the exact same idempotent payload", async () => {
+    const original = globalThis.fetch;
+    const bodies: string[] = [];
+    let calls = 0;
+    globalThis.fetch = vi.fn(async (_url, init) => {
+      bodies.push(String(init?.body));
+      if (calls++ === 0) throw new TypeError("connection reset");
+      return new Response(JSON.stringify({
+        session_id: "ses_1",
+        token: "tok",
+        principal_id: "gst_1",
+        installation_id: "ins_1",
+        identity_type: "guest",
+        verified: false,
+        expires_at: "2099-01-01T00:00:00Z",
+        address_card: {},
+      }), { status: 200 });
+    });
+    try {
+      const client = new Client(base);
+      await client.guestRegistration({ challenge_id: "chl_1", idempotency_key: "same-key" });
+      expect(bodies).toHaveLength(2);
+      expect(bodies[1]).toBe(bodies[0]);
+    } finally {
+      globalThis.fetch = original;
+    }
   });
 });
 

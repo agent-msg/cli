@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SessionStore } from "../src/session.js";
+import { RegistrationLock, SessionStore, sessionNeedsRegistration } from "../src/session.js";
 
 let home: string;
 beforeEach(() => {
@@ -51,8 +51,23 @@ describe("SessionStore", () => {
     const s = new SessionStore(home);
     s.save(sample);
     // Overwrite with garbage
-    const fs = require("node:fs");
-    fs.writeFileSync(join(home, "session.json"), "{not json");
+    writeFileSync(join(home, "session.json"), "{not json");
     expect(s.load()).toBeNull();
+  });
+
+  it("keeps old Verified sessions compatible and refreshes expiring Guests", () => {
+    expect(sessionNeedsRegistration(sample)).toBe(false);
+    expect(sessionNeedsRegistration({ ...sample, expiresAt: new Date(Date.now() + 30_000).toISOString() })).toBe(true);
+    expect(sessionNeedsRegistration({ ...sample, expiresAt: new Date(Date.now() + 120_000).toISOString() })).toBe(false);
+  });
+
+  it("serializes registration and releases the local lock", async () => {
+    const first = new RegistrationLock(home);
+    const second = new RegistrationLock(home);
+    await first.acquire();
+    await expect(second.acquire(10)).rejects.toThrow(/already in progress/);
+    first.release();
+    await expect(second.acquire(10)).resolves.toBeUndefined();
+    second.release();
   });
 });

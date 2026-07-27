@@ -140,12 +140,12 @@ async function cli(...argv: string[]) {
 }
 
 describe("register: no silent overwrite (the same-machine clobber bug)", () => {
-  it("refuses a second register in the same home and preserves the first session", async () => {
+  it("reuses a valid registration in the same home and preserves the first session", async () => {
     expect(await cli("register", "--dev-user", "99", "--allow-insecure-http")).toBe(0);
     const first = JSON.parse(readFileSync(join(home, "session.json"), "utf8"));
 
     const code = await cli("register", "--dev-user", "99", "--allow-insecure-http");
-    expect(code).not.toBe(0); // must refuse, not overwrite
+    expect(code).toBe(0);
 
     const after = JSON.parse(readFileSync(join(home, "session.json"), "utf8"));
     expect(after.sessionId).toBe(first.sessionId); // session untouched

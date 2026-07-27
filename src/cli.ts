@@ -4,10 +4,22 @@
 // reaches the client, so the server only ever sees ciphertext.
 import { generateKeypair, seal, open, sealBytes, openBytes } from "./crypto.js";
 import { Client, ApiError } from "./client.js";
-import { SessionStore, Session, defaultHome, baseHome, detectAgentRuntime, agentSessionProfile, suggestedSessionName } from "./session.js";
+import {
+  SessionStore,
+  Session,
+  defaultHome,
+  baseHome,
+  detectAgentRuntime,
+  agentSessionProfile,
+  suggestedSessionName,
+  sessionNeedsRegistration,
+  RegistrationLock,
+} from "./session.js";
 import { Contacts, fingerprint } from "./contacts.js";
 import { deviceFlowToken, DEFAULT_CLIENT_ID } from "./github.js";
 import { normalizeServerUrl } from "./serverurl.js";
+import { InstallationStore } from "./installation.js";
+import { CLI_VERSION, registerGuestFirst } from "./guest.js";
 import { readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,7 +28,7 @@ import { createHash } from "node:crypto";
 const USAGE = `agentmsg — end-to-end encrypted messaging between AI agent sessions
 
 Usage:
-  agentmsg register [--profile NAME] [--force]         register + generate keys
+  agentmsg register [--verified] [--profile NAME]      Guest first; GitHub when required
   agentmsg whoami                                       show your address card
   agentmsg contact add NAME --sid SID --pubkey PK [--user ID]
   agentmsg contact list
@@ -34,6 +46,18 @@ other commands use the server saved in the session), AGENTMSG_HOME, AGENTMSG_PRO
 Profiles: inside an agent session a profile is derived automatically, so each
 session has its own card and inbox. --profile NAME (or AGENTMSG_PROFILE) picks one
 explicitly; AGENTMSG_PROFILE=. means the single shared machine identity.`;
+
+const REGISTER_USAGE = `Usage:
+  agentmsg register [--verified] [--profile NAME] [--force]
+
+By default AgentMsg reuses this installation's Ed25519 identity and tries a
+short-lived Guest registration first. Medium-risk registration may compute a
+proof of work. High-risk registration asks the human to complete GitHub Device
+Flow. --verified skips Guest and uses the legacy GitHub registration directly.
+
+Guest identities are temporary and unverified. They have no github_user_id,
+cannot use git_user authorization, cannot send attachments, and should be
+authorized by session_id. Re-registering after expiry may change session_id.`;
 
 const DEFAULT_SERVER = "https://msg.agentmsg.org";
 
@@ -95,7 +119,29 @@ function loadSessionOrExit(store: SessionStore, home?: string): Session {
     }
     process.exit(1);
   }
+  if (sessionNeedsRegistration(s)) {
+    note("session is expired or within 60 seconds of expiry; run 'agentmsg register' to refresh it");
+    process.exit(1);
+  }
   return s;
+}
+
+function sessionOutput(s: Session, home: string): Record<string, unknown> {
+  return {
+    identity_type: s.identityType || "github",
+    verified: s.verified ?? true,
+    principal_id: s.principalId,
+    installation_id: s.installationId,
+    session_id: s.sessionId,
+    expires_at: s.expiresAt,
+    github_login: s.githubLogin || undefined,
+    github_user_id: s.githubUserId || undefined,
+    public_key: s.publicKey,
+    service: s.serverUrl,
+    server: s.serverUrl,
+    address_card: s.addressCard,
+    home,
+  };
 }
 
 export async function run(argv: string[]): Promise<number> {
@@ -116,8 +162,7 @@ export async function run(argv: string[]): Promise<number> {
         return await cmdRegister(args, store, server, home);
       case "whoami": {
         const s = loadSessionOrExit(store, home);
-        // `home` disambiguates cards when several agent sessions share a machine.
-        emit({ session_id: s.sessionId, github_login: s.githubLogin, github_user_id: s.githubUserId, public_key: s.publicKey, server: s.serverUrl, home });
+        emit(sessionOutput(s, home));
         return 0;
       }
       case "contact":
@@ -158,7 +203,15 @@ export async function run(argv: string[]): Promise<number> {
     }
   } catch (e) {
     if (e instanceof ApiError) {
-      note(`error: server error ${e.status}: ${e.code} (${e.message})`);
+      if (e.code === "guest_registration_closed") {
+        note("Guest registration is not open on this server. Retry with 'agentmsg register --verified'.");
+      } else if (e.code === "registration_closed") {
+        note("All registration is temporarily closed. Please try again later.");
+      } else if (e.status === 429) {
+        note(`Registration is rate limited (${e.code}).${e.retryAfter ? ` Retry after ${e.retryAfter}s.` : ""}`);
+      } else {
+        note(`error: server error ${e.status}: ${e.code} (${e.message})`);
+      }
     } else {
       note(`error: ${(e as Error).message}`);
     }
@@ -167,15 +220,14 @@ export async function run(argv: string[]): Promise<number> {
 }
 
 async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionStore, server: string, home: string): Promise<number> {
-  // Same-machine safety: never SILENTLY overwrite an existing session's keys and
-  // token. Registering a second session on one machine must be a deliberate act
-  // — use --profile <name> for an independent session, or --force to replace.
-  if (store.exists() && args.flags.force !== true) {
-    note(`error: a session already exists in ${home} — registering would overwrite its keys and token.`);
-    note(`   Keep both — register the new session under its own profile:`);
-    note(`      agentmsg register --profile <name>`);
-    note(`   Or replace this session on purpose:  agentmsg register --force`);
-    return 1;
+  if (args.flags.help === true) {
+    process.stdout.write(REGISTER_USAGE + "\n");
+    return 0;
+  }
+  const existing = store.load();
+  if (existing && !sessionNeedsRegistration(existing) && args.flags.force !== true && args.flags.verified !== true) {
+    emit(sessionOutput(existing, home));
+    return 0;
   }
   // Some agents (openclaw, and any harness that spawns children without passing
   // its session id down) leave us able to detect that we are inside an agent but
@@ -194,47 +246,101 @@ async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionSto
     note(`   Deliberately sharing one identity machine-wide:  export AGENTMSG_PROFILE=.`);
     return 1;
   }
-  // SEC-01: register sends the GitHub access token to this origin. Validate it
-  // (https by default; loopback http only with --allow-insecure-http), and
-  // surface a non-default origin before any credential leaves the machine.
+  // Validate the origin before any challenge, bearer token or GitHub token can
+  // leave this machine.
   const raw = (args.flags.server as string) || server;
   const srv = normalizeServerUrl(raw, args.flags["allow-insecure-http"] === true);
   if (new URL(srv).origin !== new URL(DEFAULT_SERVER).origin) {
-    note(`>> WARNING: registering with ${new URL(srv).origin} — your GitHub token and session token will be sent there.`);
+    note(`>> WARNING: registering with ${new URL(srv).origin}; registration credentials will be sent there.`);
   }
-  let credential: string;
-  if (args.flags["dev-user"]) {
-    const login = (args.flags["dev-login"] as string) || "";
-    credential = login ? `${args.flags["dev-user"]}:${login}` : String(args.flags["dev-user"]);
-  } else {
-    credential = await deviceFlowToken({
-      clientId: (args.flags["client-id"] as string) || DEFAULT_CLIENT_ID,
-      onCode: (code, uri) => {
-        note(`>> To register, open ${uri} in your browser and enter code: ${code}`);
-        note(">> Waiting for authorization...");
-      },
-    });
+  const lock = new RegistrationLock(home);
+  await lock.acquire();
+  try {
+    // A process that waited for the lock should reuse the winner's result.
+    const current = store.load();
+    if (current && !sessionNeedsRegistration(current) && args.flags.force !== true && args.flags.verified !== true) {
+      emit(sessionOutput(current, home));
+      return 0;
+    }
+    const installation = new InstallationStore(home).loadOrCreate();
+    const client = new Client(srv);
+    const ctl = new AbortController();
+    const cancel = () => ctl.abort();
+    process.once("SIGINT", cancel);
+    try {
+      if (args.flags.verified === true || args.flags["dev-user"]) {
+        let credential: string;
+        if (args.flags["dev-user"]) {
+          const login = (args.flags["dev-login"] as string) || "";
+          credential = login ? `${args.flags["dev-user"]}:${login}` : String(args.flags["dev-user"]);
+        } else {
+          credential = await deviceFlowToken({
+            clientId: (args.flags["client-id"] as string) || DEFAULT_CLIENT_ID,
+            signal: ctl.signal,
+            onCode: (code, uri) => {
+              note(`>> To register, open ${uri} in your browser and enter code: ${code}`);
+              note(">> Waiting for authorization...");
+            },
+          });
+        }
+        let r;
+        try {
+          r = await client.register(credential);
+        } finally {
+          credential = "";
+        }
+        const kp = await generateKeypair();
+        const session: Session = {
+          serverUrl: srv,
+          sessionId: r.session_id,
+          token: r.token,
+          githubLogin: r.github_login,
+          githubUserId: r.github_user_id,
+          publicKey: kp.publicKey,
+          privateKey: kp.privateKey,
+          identityType: "github",
+          verified: true,
+        };
+        store.save(session);
+        emit(sessionOutput(session, home));
+        return 0;
+      }
+
+      const result = await registerGuestFirst({
+        client,
+        installation,
+        serverOrigin: new URL(srv).origin,
+        signal: ctl.signal,
+        note,
+      });
+      const kp = await generateKeypair();
+      const session: Session = {
+        serverUrl: srv,
+        sessionId: result.session_id,
+        token: result.token,
+        githubLogin: "github_login" in result ? result.github_login : "",
+        githubUserId: "github_user_id" in result ? result.github_user_id : "",
+        publicKey: kp.publicKey,
+        privateKey: kp.privateKey,
+        identityType: result.identity_type,
+        verified: result.verified,
+        principalId: result.principal_id,
+        installationId: result.installation_id,
+        expiresAt: "expires_at" in result ? result.expires_at : undefined,
+        addressCard: result.address_card,
+      };
+      store.save(session);
+      emit(sessionOutput(session, home));
+      if (!session.verified) {
+        note("Guest identity: temporary and unverified. Share session_id for authorization; attachments are disabled.");
+      }
+      return 0;
+    } finally {
+      process.removeListener("SIGINT", cancel);
+    }
+  } finally {
+    lock.release();
   }
-  const client = new Client(srv);
-  const r = await client.register(credential);
-  const kp = await generateKeypair(); // one keypair per session
-  const session: Session = {
-    serverUrl: srv,
-    sessionId: r.session_id,
-    token: r.token,
-    githubLogin: r.github_login,
-    githubUserId: r.github_user_id,
-    publicKey: kp.publicKey,
-    privateKey: kp.privateKey,
-  };
-  store.save(session);
-  emit({
-    session_id: r.session_id,
-    github_login: r.github_login,
-    github_user_id: r.github_user_id,
-    public_key: kp.publicKey,
-  });
-  return 0;
 }
 
 function cmdContact(args: ReturnType<typeof parseArgs>, contacts: Contacts): number {
@@ -272,6 +378,10 @@ async function cmdPolicy(args: ReturnType<typeof parseArgs>, store: SessionStore
   const mode = String(args.flags.mode || "");
   const allow = args.flags.allow ? String(args.flags.allow).split(",").map((x) => x.trim()).filter(Boolean) : [];
   const ackRisk = args.flags["i-understand-the-risk"] === true;
+  if (s.identityType === "guest" && mode !== "session_id") {
+    note("error: Guest sessions can only use session_id policy; verify with GitHub for git_user policy.");
+    return 1;
+  }
   await new Client(s.serverUrl, s.token).setPolicy(mode, allow, ackRisk);
   emit({ status: "policy_updated", mode });
   return 0;
@@ -289,6 +399,11 @@ async function cmdSend(args: ReturnType<typeof parseArgs>, store: SessionStore, 
   const addr = contacts.resolve(to)!;
   const pubkey = (args.flags["to-pubkey"] as string) || addr.publicKey;
   const client = new Client(s.serverUrl, s.token);
+
+  if (files.length > 0 && s.identityType === "guest") {
+    note("error: Guest sessions cannot send attachments; verify with GitHub first.");
+    return 1;
+  }
 
   // Attachments are ALWAYS end-to-end encrypted: without the recipient's public
   // key we cannot seal them, and the server refuses plaintext attachments.

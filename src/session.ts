@@ -2,10 +2,26 @@
 // AGENTMSG_HOME/session.json with owner-only permissions. The private key never
 // leaves this file. One AGENTMSG_HOME = one session, so several homes on one
 // machine hold independent sessions (and independent keys).
-import { mkdirSync, readFileSync, writeFileSync, rmSync, chmodSync } from "node:fs";
+import { closeSync, constants, mkdirSync, openSync, readFileSync, writeFileSync, rmSync, statSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import { createHash, randomBytes } from "node:crypto";
+import { atomicWritePrivate } from "./installation.js";
+
+export interface AddressCard {
+  version: number;
+  service: string;
+  identity_type: "guest" | "github";
+  principal_id: string;
+  installation_id: string;
+  session_id: string;
+  verified: boolean;
+  expires_at?: string;
+  public_key: string;
+  signature: string;
+  github_user_id?: string;
+  github_login?: string;
+}
 
 export interface Session {
   serverUrl: string;
@@ -15,6 +31,12 @@ export interface Session {
   githubUserId: string;
   publicKey: string;
   privateKey: string;
+  identityType?: "guest" | "github";
+  verified?: boolean;
+  principalId?: string;
+  installationId?: string;
+  expiresAt?: string;
+  addressCard?: AddressCard;
 }
 
 // A profile selects an isolated subdirectory of the base home, so several
@@ -167,11 +189,71 @@ export class SessionStore {
 
   save(s: Session): void {
     mkdirSync(this.home, { recursive: true, mode: 0o700 });
-    writeFileSync(this.file, JSON.stringify(s, null, 2), { mode: 0o600 });
-    chmodSync(this.file, 0o600); // enforce even if the file pre-existed
+    atomicWritePrivate(this.file, JSON.stringify(s, null, 2) + "\n");
   }
 
   clear(): void {
     rmSync(this.file, { force: true });
+  }
+}
+
+/** Old Verified sessions have no expiry and remain compatible. */
+export function sessionNeedsRegistration(s: Session, now = Date.now(), skewMs = 60_000): boolean {
+  if (!s.expiresAt) return false;
+  const expires = Date.parse(s.expiresAt);
+  return !Number.isFinite(expires) || expires - now <= skewMs;
+}
+
+export class RegistrationLock {
+  private readonly file: string;
+  private readonly owner = randomBytes(16).toString("hex");
+  private fd = -1;
+
+  constructor(private readonly home: string) {
+    this.file = join(home, "registration.lock");
+  }
+
+  async acquire(timeoutMs = 30_000): Promise<void> {
+    mkdirSync(this.home, { recursive: true, mode: 0o700 });
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      try {
+        this.fd = openSync(this.file, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+        writeFileSync(this.fd, JSON.stringify({
+          pid: process.pid,
+          owner: this.owner,
+          created_at: new Date().toISOString(),
+        }));
+        return;
+      } catch (error) {
+        const e = error as NodeJS.ErrnoException;
+        if (e.code !== "EEXIST") throw error;
+        try {
+          // Device Flow can legitimately take up to 15 minutes, so a lock must
+          // not be stolen while its owner is waiting for the human.
+          if (Date.now() - statSync(this.file).mtimeMs > 20 * 60_000) {
+            rmSync(this.file, { force: true });
+            continue;
+          }
+        } catch {
+          continue;
+        }
+        if (Date.now() >= deadline) throw new Error("another registration is already in progress");
+        await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      }
+    }
+  }
+
+  release(): void {
+    if (this.fd >= 0) {
+      closeSync(this.fd);
+      this.fd = -1;
+    }
+    try {
+      const current = JSON.parse(readFileSync(this.file, "utf8")) as { owner?: string };
+      if (current.owner === this.owner) rmSync(this.file, { force: true });
+    } catch {
+      // Missing/replaced locks do not belong to this instance.
+    }
   }
 }

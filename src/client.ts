@@ -13,6 +13,8 @@ export class ApiError extends Error {
     public status: number,
     public code: string,
     message: string,
+    public details: Record<string, unknown> = {},
+    public retryAfter = 0,
   ) {
     super(message);
     this.name = "ApiError";
@@ -24,6 +26,76 @@ export interface RegisterResponse {
   token: string;
   github_login: string;
   github_user_id: string;
+}
+
+export interface GuestChallengeRequest {
+  protocol_version: number;
+  public_key: string;
+  client: { name: string; version: string; platform: string; arch: string };
+}
+
+export interface GuestChallengeResponse {
+  challenge_id: string;
+  nonce: string;
+  server_origin: string;
+  intended_action: "guest_register" | "verified_register";
+  risk_tier: "low" | "medium" | "high";
+  expires_at: string;
+  guest_expires_at: string;
+  principal_id: string;
+  installation_id: string;
+  session_id: string;
+  github_user_id?: string;
+  github_login?: string;
+  pow: { algorithm: "none" | "sha256"; difficulty_bits: number };
+}
+
+export interface AddressCardDTO {
+  version: number;
+  service: string;
+  identity_type: "guest" | "github";
+  principal_id: string;
+  installation_id: string;
+  session_id: string;
+  verified: boolean;
+  expires_at?: string;
+  public_key: string;
+  signature: string;
+  github_user_id?: string;
+  github_login?: string;
+}
+
+export interface GuestRegistrationResponse {
+  session_id: string;
+  token: string;
+  principal_id: string;
+  installation_id: string;
+  identity_type: "guest";
+  verified: false;
+  expires_at: string;
+  address_card: AddressCardDTO;
+}
+
+export interface GitHubUpgradeResponse {
+  risk_tier: "high";
+  action: "github_auth_required";
+  registration_flow_id: string;
+  verification_uri: string;
+  github_client_id?: string;
+  message?: string;
+  expires_at: string;
+}
+
+export interface VerifiedRegistrationResponse {
+  session_id: string;
+  token: string;
+  principal_id: string;
+  installation_id: string;
+  identity_type: "github";
+  verified: true;
+  github_user_id: string;
+  github_login: string;
+  address_card: AddressCardDTO;
 }
 
 export interface AttachmentGet {
@@ -152,7 +224,31 @@ export class Client {
     this.serverUrl = normalizeServerUrl(serverUrl, true);
   }
 
-  private async call<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async call<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+    retryNetwork = false,
+  ): Promise<T> {
+    const attempts = retryNetwork ? 3 : 1;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      try {
+        return await this.callOnce<T>(method, path, body);
+      } catch (error) {
+        lastError = error;
+        const retryable =
+          error instanceof ApiError
+            ? error.status === 0 && (error.code === "timeout" || error.code === "network_error")
+            : false;
+        if (!retryable || attempt + 1 >= attempts) throw error;
+        await new Promise<void>((resolve) => setTimeout(resolve, 250 * 2 ** attempt));
+      }
+    }
+    throw lastError;
+  }
+
+  private async callOnce<T>(method: string, path: string, body?: unknown): Promise<T> {
     const headers: Record<string, string> = {};
     if (this.token) headers["Authorization"] = `Bearer ${this.token}`;
     let payload: string | undefined;
@@ -170,27 +266,56 @@ export class Client {
     } catch (e) {
       clearTimeout(timer);
       if ((e as Error).name === "AbortError") throw new ApiError(0, "timeout", `request to ${path} timed out`);
-      throw e;
+      throw new ApiError(0, "network_error", `request to ${path} failed`);
     }
     clearTimeout(timer);
     const raw = await readCapped(resp, MAX_RESPONSE_BYTES);
     if (!resp.ok) {
       let code = "http_error";
       let msg = raw;
+      let details: Record<string, unknown> = {};
       try {
         const e = JSON.parse(raw) as ApiErrorBody;
+        details = e as unknown as Record<string, unknown>;
         code = e.error || code;
         msg = e.message || e.error || raw;
       } catch {
         /* non-JSON error body */
       }
-      throw new ApiError(resp.status, code, msg);
+      const retryAfter = Number(resp.headers.get("retry-after") || "0");
+      throw new ApiError(resp.status, code, msg, details, Number.isFinite(retryAfter) ? retryAfter : 0);
     }
     return (raw ? JSON.parse(raw) : {}) as T;
   }
 
   register(credential: string): Promise<RegisterResponse> {
     return this.call("POST", "/v1/register", { credential });
+  }
+
+  guestChallenge(input: GuestChallengeRequest): Promise<GuestChallengeResponse> {
+    return this.call("POST", "/v1/guest/challenges", input);
+  }
+
+  guestRegistration(input: Record<string, unknown>): Promise<GuestRegistrationResponse> {
+    return this.call("POST", "/v1/guest/registrations", input, true);
+  }
+
+  verifiedChallenge(input: {
+    registration_flow_id: string;
+    public_key: string;
+    github_credential: string;
+  }): Promise<GuestChallengeResponse> {
+    // If the response is lost after the server persisted verification, replay
+    // this exact flow/key/token request before dropping the temporary token.
+    return this.call("POST", "/v1/verified/challenges", input, true);
+  }
+
+  verifiedRegistration(input: Record<string, unknown>): Promise<VerifiedRegistrationResponse> {
+    return this.call("POST", "/v1/verified/registrations", input, true);
+  }
+
+  addressCard(): Promise<AddressCardDTO> {
+    return this.call("GET", "/v1/whoami/card");
   }
 
   unregister(): Promise<void> {

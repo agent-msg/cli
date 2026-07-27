@@ -10,3 +10,6 @@ for (const k of Object.keys(process.env)) {
     delete process.env[k];
   }
 }
+// Tests must never prompt a desktop credential store. The fallback is itself
+// security-tested and keeps each test fully isolated in its temporary home.
+process.env.AGENTMSG_DISABLE_KEYCHAIN = "1";
