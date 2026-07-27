@@ -79,17 +79,19 @@ function runPowerShell(script: string, path: string): boolean {
 }
 
 function hardenWindowsDirectory(path: string): void {
-  const script = [
-    "$p=$args[0]",
-    "$me=[Security.Principal.WindowsIdentity]::GetCurrent().Name",
-    "$acl=Get-Acl -LiteralPath $p",
-    "$acl.SetAccessRuleProtection($true,$false)",
-    "foreach($r in @($acl.Access)){$acl.RemoveAccessRuleAll($r)}",
-    "$rule=New-Object Security.AccessControl.FileSystemAccessRule($me,'FullControl','ContainerInherit,ObjectInherit','None','Allow')",
-    "$acl.SetAccessRule($rule)",
-    "Set-Acl -LiteralPath $p -AclObject $acl",
-  ].join(";");
-  if (!runPowerShell(script, path)) {
+  const identity = spawnSync("whoami.exe", [], {
+    encoding: "utf8",
+    timeout: 5_000,
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "ignore"],
+  }).stdout.trim();
+  if (!identity) throw new Error("could not resolve the current Windows identity");
+  const result = spawnSync(
+    "icacls.exe",
+    [path, "/inheritance:r", "/grant:r", `${identity}:(OI)(CI)F`],
+    { encoding: "utf8", timeout: 10_000, windowsHide: true, stdio: ["ignore", "ignore", "ignore"] },
+  );
+  if (result.status !== 0) {
     throw new Error("could not restrict AGENTMSG_HOME to the current Windows user");
   }
 }
@@ -97,10 +99,11 @@ function hardenWindowsDirectory(path: string): void {
 function validateWindowsPrivateFile(path: string): void {
   const script = [
     "$p=$args[0]",
-    "$me=[Security.Principal.WindowsIdentity]::GetCurrent().Name",
+    "$me=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
     "$acl=Get-Acl -LiteralPath $p",
-    "if($acl.Owner -ne $me){exit 2}",
-    "$bad=@($acl.Access | Where-Object {$_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -ne $me})",
+    "$owner=(New-Object Security.Principal.NTAccount($acl.Owner)).Translate([Security.Principal.SecurityIdentifier]).Value",
+    "if($owner -ne $me){exit 2}",
+    "$bad=@($acl.Access | Where-Object {$_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -ne $me})",
     "if($bad.Count -ne 0){exit 3}",
   ].join(";");
   if (!runPowerShell(script, path)) {
