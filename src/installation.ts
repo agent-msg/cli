@@ -69,15 +69,6 @@ function ensureSecureHome(home: string): void {
   if (process.platform === "win32") hardenWindowsDirectory(home);
 }
 
-function runPowerShell(script: string, path: string): boolean {
-  const result = spawnSync(
-    "powershell.exe",
-    ["-NoProfile", "-NonInteractive", "-Command", script, path],
-    { encoding: "utf8", timeout: 10_000, windowsHide: true, stdio: ["ignore", "ignore", "ignore"] },
-  );
-  return result.status === 0;
-}
-
 function hardenWindowsDirectory(path: string): void {
   const identity = spawnSync("whoami.exe", [], {
     encoding: "utf8",
@@ -103,12 +94,19 @@ function validateWindowsPrivateFile(path: string): void {
     "$allowed=@($me,'S-1-5-18','S-1-5-32-544')",
     "$acl=Get-Acl -LiteralPath $p",
     "$owner=(New-Object Security.Principal.NTAccount($acl.Owner)).Translate([Security.Principal.SecurityIdentifier]).Value",
-    "if($allowed -notcontains $owner){exit 2}",
-    "$bad=@($acl.Access | Where-Object {$_.AccessControlType -eq 'Allow' -and $allowed -notcontains $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value})",
-    "if($bad.Count -ne 0){exit 3}",
+    "$rules=@($acl.Access | ForEach-Object {$_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value})",
+    "if($allowed -notcontains $owner){Write-Output ('owner='+$owner);Write-Output ('rules='+($rules -join ','));exit 2}",
+    "$bad=@($rules | Where-Object {$allowed -notcontains $_})",
+    "if($bad.Count -ne 0){Write-Output ('owner='+$owner);Write-Output ('rules='+($rules -join ','));exit 3}",
   ].join(";");
-  if (!runPowerShell(script, path)) {
-    throw new Error("installation key Windows ACL or owner is unsafe");
+  const result = spawnSync(
+    "powershell.exe",
+    ["-NoProfile", "-NonInteractive", "-Command", script, path],
+    { encoding: "utf8", timeout: 10_000, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] },
+  );
+  if (result.status !== 0) {
+    const detail = result.stdout.trim().replace(/\s+/g, " ");
+    throw new Error(`installation key Windows ACL or owner is unsafe${detail ? ` (${detail})` : ""}`);
   }
 }
 
