@@ -89,12 +89,13 @@ function hardenWindowsDirectory(path: string): void {
 
 function validateWindowsPrivateFile(path: string): void {
   const script = [
+    "$ErrorActionPreference='Stop'",
     "$p=$env:AGENTMSG_ACL_PATH",
     "$me=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
     "$allowed=@($me,'S-1-5-18','S-1-5-32-544')",
     "$acl=Get-Acl -LiteralPath $p",
-    "$owner=(New-Object Security.Principal.NTAccount($acl.Owner)).Translate([Security.Principal.SecurityIdentifier]).Value",
-    "$rules=@($acl.Access | ForEach-Object {$_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value})",
+    "$owner=$acl.GetOwner([Security.Principal.SecurityIdentifier]).Value",
+    "$rules=@($acl.Access | ForEach-Object {($_.IdentityReference.Translate([Security.Principal.SecurityIdentifier])).Value})",
     "if($allowed -notcontains $owner){Write-Output ('owner='+$owner);Write-Output ('rules='+($rules -join ','));exit 2}",
     "$bad=@($rules | Where-Object {$allowed -notcontains $_})",
     "if($bad.Count -ne 0){Write-Output ('owner='+$owner);Write-Output ('rules='+($rules -join ','));exit 3}",
@@ -107,11 +108,11 @@ function validateWindowsPrivateFile(path: string): void {
       timeout: 10_000,
       windowsHide: true,
       env: { ...process.env, AGENTMSG_ACL_PATH: path },
-      stdio: ["ignore", "pipe", "ignore"],
+      stdio: ["ignore", "pipe", "pipe"],
     },
   );
   if (result.status !== 0) {
-    const detail = result.stdout.trim().replace(/\s+/g, " ");
+    const detail = `${result.stdout} ${result.stderr}`.trim().replace(/\s+/g, " ");
     throw new Error(`installation key Windows ACL or owner is unsafe${detail ? ` (${detail})` : ""}`);
   }
 }
