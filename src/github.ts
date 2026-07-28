@@ -21,6 +21,11 @@ export interface GithubOptions {
   signal?: AbortSignal;
 }
 
+export interface GitHubIdentity {
+  githubUserId: string;
+  githubLogin: string;
+}
+
 const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 // fetch with a per-request timeout (HARD-01): GitHub, like any host, must not be
@@ -79,4 +84,27 @@ export async function deviceFlowToken(opts: GithubOptions): Promise<string> {
     throw new Error(`github authorization failed: ${t.error || "unknown"}`);
   }
   throw new Error("github authorization timed out");
+}
+
+export async function githubIdentity(
+  credential: string,
+  options: { base?: string; signal?: AbortSignal } = {},
+): Promise<GitHubIdentity> {
+  const base = options.base || "https://api.github.com";
+  const response = await fetchTimeout(`${base}/user`, {
+    method: "GET",
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${credential}`,
+      "User-Agent": "agentmsg-cli",
+    },
+  }, 20_000, options.signal);
+  if (!response.ok) throw new Error(`github identity request failed: ${response.status}`);
+  const body = (await response.json()) as { id?: number | string; login?: string };
+  const githubUserId = String(body.id ?? "");
+  const githubLogin = typeof body.login === "string" ? body.login : "";
+  if (!/^\d+$/.test(githubUserId) || !githubLogin) {
+    throw new Error("github identity response was incomplete");
+  }
+  return { githubUserId, githubLogin };
 }

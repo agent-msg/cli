@@ -206,9 +206,6 @@ export function validateChallenge(
     if (challenge.risk_tier !== "high" || challenge.pow.algorithm !== "none" || difficulty !== 0) {
       throw new Error("invalid Verified challenge risk or PoW binding");
     }
-    if (!/^\d+$/.test(challenge.github_user_id || "") || !challenge.github_login) {
-      throw new Error("Verified challenge omitted GitHub identity binding");
-    }
   } else if (challenge.risk_tier === "low") {
     if (challenge.pow.algorithm !== "none" || difficulty !== 0) throw new Error("low-risk challenge requested PoW");
   } else if (challenge.risk_tier === "medium") {

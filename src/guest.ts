@@ -14,7 +14,7 @@ import {
   GuestRegistrationResponse,
   VerifiedRegistrationResponse,
 } from "./client.js";
-import { deviceFlowToken, DEFAULT_CLIENT_ID } from "./github.js";
+import { deviceFlowToken, githubIdentity, DEFAULT_CLIENT_ID } from "./github.js";
 import type { InstallationKey } from "./installation.js";
 
 export const CLI_VERSION = "0.2.0";
@@ -133,8 +133,13 @@ async function finishVerified(
       options.note("Waiting for authorization...");
     },
   });
+  let identity: Awaited<ReturnType<typeof githubIdentity>>;
   let challenge: Challenge;
   try {
+    identity = await githubIdentity(credential, {
+      base: options.githubBase,
+      signal: options.signal,
+    });
     challenge = (await options.client.verifiedChallenge({
       registration_flow_id: flow.registration_flow_id,
       public_key: options.installation.publicKey,
@@ -155,8 +160,8 @@ async function finishVerified(
     session_id: challenge.session_id,
     verified: true,
     public_key: options.installation.publicKey,
-    github_user_id: challenge.github_user_id,
-    github_login: challenge.github_login,
+    github_user_id: identity.githubUserId,
+    github_login: identity.githubLogin,
   };
   const addressCardSignature = signAddressCard(options.installation, card);
   const request = {

@@ -22,6 +22,8 @@ suite("real Go server admission integration", () => {
           verification_uri: "https://github.com/login/device",
           interval: 0,
         }));
+      } else if (req.url === "/user") {
+        res.end(JSON.stringify({ id: 42, login: "alice" }));
       } else {
         res.end(JSON.stringify({ access_token: "42:alice" }));
       }
