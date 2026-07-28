@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createServer, Server } from "node:http";
 import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { run } from "../src/cli.js";
 import { defaultHome } from "../src/session.js";
 
@@ -51,7 +51,8 @@ describe("defaultHome + profiles", () => {
   // inbox, so `receive --ack` in one session consumes the other's messages.
   // With no explicit profile we derive one from the agent session id.
   it("derives a distinct home per agent session id", () => {
-    process.env.AGENTMSG_HOME = "/tmp/base";
+    const baseHome = join(tmpdir(), "base");
+    process.env.AGENTMSG_HOME = baseHome;
     delete process.env.AGENTMSG_PROFILE;
 
     process.env.CLAUDE_CODE_SESSION_ID = "f26c7ee3-ff65-4ab8-9d5c-f8ade22418b0";
@@ -60,32 +61,34 @@ describe("defaultHome + profiles", () => {
     const b = defaultHome();
 
     expect(a).not.toBe(b);
-    expect(a).not.toBe("/tmp/base");
-    expect(a.startsWith("/tmp/base/")).toBe(true);
+    expect(a).not.toBe(baseHome);
+    expect(a.startsWith(baseHome + sep)).toBe(true);
   });
 
   it("is stable for the same agent session id (survives repeated calls)", () => {
-    process.env.AGENTMSG_HOME = "/tmp/base";
+    process.env.AGENTMSG_HOME = join(tmpdir(), "base");
     delete process.env.AGENTMSG_PROFILE;
     process.env.CLAUDE_CODE_SESSION_ID = "f26c7ee3-ff65-4ab8-9d5c-f8ade22418b0";
     expect(defaultHome()).toBe(defaultHome());
   });
 
   it("an auto-derived profile is always a safe path segment", () => {
-    process.env.AGENTMSG_HOME = "/tmp/base";
+    const baseHome = join(tmpdir(), "base");
+    process.env.AGENTMSG_HOME = baseHome;
     delete process.env.AGENTMSG_PROFILE;
     // Even a hostile session id must not escape the base home.
     process.env.CLAUDE_CODE_SESSION_ID = "../../etc/passwd";
     const h = defaultHome();
-    expect(h.startsWith("/tmp/base/")).toBe(true);
+    expect(h.startsWith(baseHome + sep)).toBe(true);
     expect(h).not.toContain("..");
   });
 
   it("an explicit profile still wins over the agent session id", () => {
-    process.env.AGENTMSG_HOME = "/tmp/base";
+    const baseHome = join(tmpdir(), "base");
+    process.env.AGENTMSG_HOME = baseHome;
     delete process.env.AGENTMSG_PROFILE;
     process.env.CLAUDE_CODE_SESSION_ID = "f26c7ee3-ff65-4ab8-9d5c-f8ade22418b0";
-    expect(defaultHome("work")).toBe(join("/tmp/base", "work"));
+    expect(defaultHome("work")).toBe(join(baseHome, "work"));
   });
 
   it("AGENTMSG_PROFILE still wins over the agent session id", () => {
@@ -140,12 +143,12 @@ async function cli(...argv: string[]) {
 }
 
 describe("register: no silent overwrite (the same-machine clobber bug)", () => {
-  it("refuses a second register in the same home and preserves the first session", async () => {
+  it("reuses a valid registration in the same home and preserves the first session", async () => {
     expect(await cli("register", "--dev-user", "99", "--allow-insecure-http")).toBe(0);
     const first = JSON.parse(readFileSync(join(home, "session.json"), "utf8"));
 
     const code = await cli("register", "--dev-user", "99", "--allow-insecure-http");
-    expect(code).not.toBe(0); // must refuse, not overwrite
+    expect(code).toBe(0);
 
     const after = JSON.parse(readFileSync(join(home, "session.json"), "utf8"));
     expect(after.sessionId).toBe(first.sessionId); // session untouched
