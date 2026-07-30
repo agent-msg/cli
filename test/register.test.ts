@@ -155,6 +155,9 @@ describe("register: no silent overwrite (the same-machine clobber bug)", () => {
     expect(after.privateKey).toBe(first.privateKey); // keys preserved
   });
 
+  // Windows runners can take several seconds to generate the replacement
+  // Ed25519 keypair under load; this test is about overwrite semantics, not a
+  // five-second performance budget.
   it("--force intentionally replaces the existing session", async () => {
     expect(await cli("register", "--dev-user", "99", "--allow-insecure-http")).toBe(0);
     const first = JSON.parse(readFileSync(join(home, "session.json"), "utf8"));
@@ -162,7 +165,7 @@ describe("register: no silent overwrite (the same-machine clobber bug)", () => {
     expect(await cli("register", "--dev-user", "99", "--allow-insecure-http", "--force")).toBe(0);
     const after = JSON.parse(readFileSync(join(home, "session.json"), "utf8"));
     expect(after.sessionId).not.toBe(first.sessionId); // replaced on purpose
-  });
+  }, 15_000);
 
   // The reported bug, end to end: two agent sessions started in the SAME
   // directory used to land on one session.json — same card, one shared inbox.
