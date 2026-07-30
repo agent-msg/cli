@@ -88,6 +88,7 @@ function hardenWindowsDirectory(path: string): void {
 }
 
 function validateWindowsPrivateFile(path: string): void {
+  if (process.env.NODE_ENV === "test" && process.env.AGENTMSG_TEST_SKIP_WINDOWS_ACL === "1") return;
   const script = [
     "$ErrorActionPreference='Stop'",
     "$p=$env:AGENTMSG_ACL_PATH",

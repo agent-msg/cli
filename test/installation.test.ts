@@ -5,11 +5,16 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { InstallationStore } from "../src/installation.js";
 
 let home: string;
+const savedDisableKeychain = process.env.AGENTMSG_DISABLE_KEYCHAIN;
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "agentmsg-installation-"));
   process.env.AGENTMSG_DISABLE_KEYCHAIN = "1";
 });
-afterEach(() => rmSync(home, { recursive: true, force: true }));
+afterEach(() => {
+  if (savedDisableKeychain === undefined) delete process.env.AGENTMSG_DISABLE_KEYCHAIN;
+  else process.env.AGENTMSG_DISABLE_KEYCHAIN = savedDisableKeychain;
+  rmSync(home, { recursive: true, force: true });
+});
 
 describe("installation identity storage", () => {
   it("reuses one Ed25519 identity and stores fallback files owner-only", () => {
