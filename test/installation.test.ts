@@ -6,13 +6,17 @@ import { InstallationStore } from "../src/installation.js";
 
 let home: string;
 const savedDisableKeychain = process.env.AGENTMSG_DISABLE_KEYCHAIN;
+const savedSkipWindowsAcl = process.env.AGENTMSG_TEST_SKIP_WINDOWS_ACL;
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "agentmsg-installation-"));
   process.env.AGENTMSG_DISABLE_KEYCHAIN = "1";
+  process.env.AGENTMSG_TEST_SKIP_WINDOWS_ACL = "1";
 });
 afterEach(() => {
   if (savedDisableKeychain === undefined) delete process.env.AGENTMSG_DISABLE_KEYCHAIN;
   else process.env.AGENTMSG_DISABLE_KEYCHAIN = savedDisableKeychain;
+  if (savedSkipWindowsAcl === undefined) delete process.env.AGENTMSG_TEST_SKIP_WINDOWS_ACL;
+  else process.env.AGENTMSG_TEST_SKIP_WINDOWS_ACL = savedSkipWindowsAcl;
   rmSync(home, { recursive: true, force: true });
 });
 
