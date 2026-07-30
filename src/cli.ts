@@ -20,8 +20,9 @@ import { deviceFlowToken, DEFAULT_CLIENT_ID } from "./github.js";
 import { normalizeServerUrl } from "./serverurl.js";
 import { InstallationStore } from "./installation.js";
 import { CLI_VERSION, registerGuestFirst } from "./guest.js";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 
@@ -40,6 +41,7 @@ Usage:
   agentmsg subscribe [--manage]                         Pro ($8/month, Stripe)
   agentmsg billing
   agentmsg unregister
+  agentmsg skill install [--target claude|codex|all] [--force]
 
 Env: AGENTMSG_SERVER (default https://msg.agentmsg.org; read only by 'register' —
 other commands use the server saved in the session), AGENTMSG_HOME, AGENTMSG_PROFILE
@@ -104,6 +106,36 @@ function note(msg: string): void {
   process.stderr.write(msg + "\n");
 }
 
+function cmdSkill(args: ReturnType<typeof parseArgs>): number {
+  if (args._[0] !== "install") {
+    note("usage: agentmsg skill install [--target claude|codex|all] [--force]");
+    return 2;
+  }
+  const target = String(args.flags.target || "all");
+  if (!["claude", "codex", "all"].includes(target)) {
+    note("error: --target must be claude, codex, or all");
+    return 2;
+  }
+  const source = join(dirname(fileURLToPath(import.meta.url)), "..", "SKILL.md");
+  if (!existsSync(source)) {
+    note("error: packaged SKILL.md is missing");
+    return 1;
+  }
+  const home = homedir();
+  const targets = target === "all" ? ["claude", "codex"] : [target];
+  for (const name of targets) {
+    const destination = join(home, name === "claude" ? ".claude" : ".codex", "skills", "agent-msg", "SKILL.md");
+    if (existsSync(destination) && args.flags.force !== true) {
+      note(`skip: ${destination} already exists (use --force to replace it)`);
+      continue;
+    }
+    mkdirSync(dirname(destination), { recursive: true });
+    copyFileSync(source, destination);
+    note(`installed: ${destination}`);
+  }
+  return 0;
+}
+
 function loadSessionOrExit(store: SessionStore, home?: string): Session {
   const s = store.load();
   if (!s) {
@@ -144,6 +176,14 @@ function sessionOutput(s: Session, home: string): Record<string, unknown> {
   };
 }
 
+function noteAddressCard(s: Session): void {
+  note("Address card (share only over a trusted channel):");
+  note(`  session_id: ${s.sessionId}`);
+  note(`  public_key: ${s.publicKey}`);
+  if (s.githubUserId) note(`  github_user_id: ${s.githubUserId}`);
+  if (s.expiresAt) note(`  expires_at: ${s.expiresAt}`);
+}
+
 export async function run(argv: string[]): Promise<number> {
   const [cmd, ...rest] = argv;
   const args = parseArgs(rest);
@@ -160,6 +200,8 @@ export async function run(argv: string[]): Promise<number> {
     switch (cmd) {
       case "register":
         return await cmdRegister(args, store, server, home);
+      case "skill":
+        return cmdSkill(args);
       case "whoami": {
         const s = loadSessionOrExit(store, home);
         emit(sessionOutput(s, home));
@@ -227,6 +269,7 @@ async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionSto
   const existing = store.load();
   if (existing && !sessionNeedsRegistration(existing) && args.flags.force !== true && args.flags.verified !== true) {
     emit(sessionOutput(existing, home));
+    noteAddressCard(existing);
     return 0;
   }
   // Some agents (openclaw, and any harness that spawns children without passing
@@ -260,6 +303,7 @@ async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionSto
     const current = store.load();
     if (current && !sessionNeedsRegistration(current) && args.flags.force !== true && args.flags.verified !== true) {
       emit(sessionOutput(current, home));
+      noteAddressCard(current);
       return 0;
     }
     const installation = new InstallationStore(home).loadOrCreate();
@@ -303,6 +347,7 @@ async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionSto
         };
         store.save(session);
         emit(sessionOutput(session, home));
+        noteAddressCard(session);
         return 0;
       }
 
@@ -331,6 +376,7 @@ async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionSto
       };
       store.save(session);
       emit(sessionOutput(session, home));
+      noteAddressCard(session);
       if (!session.verified) {
         note("Guest identity: temporary and unverified. Share session_id for authorization; attachments are disabled.");
       }

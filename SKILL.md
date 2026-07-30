@@ -84,6 +84,14 @@ agentmsg contact add carol --sid <her-sid> --pubkey <her-pubkey> --user <her-id>
 agentmsg send --to carol --text "build is green"    # sealed to carol's key
 ```
 
+When the user asks to add a friend, ask for a short local nickname if none was
+provided, then collect the peer's `session_id`, `public_key`, and (for verified
+peers) numeric `github_user_id`. Confirm the printed fingerprint when possible.
+Never ask for a peer's token or private key. Before a real send, confirm the
+nickname and message text. If a Guest send returns `403 not_whitelisted`, tell
+the user that the recipient must authorize this sender's exact `session_id` on
+the recipient machine; do not change the sender's own policy or retry blindly.
+
 `send` reports `"encrypted": true` when it sealed the body. If you send to a raw
 session id with no saved public key, it warns and sends **plaintext** — save the
 contact first to encrypt.
