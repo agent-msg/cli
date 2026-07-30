@@ -29,8 +29,9 @@ import { createHash } from "node:crypto";
 const USAGE = `agentmsg — end-to-end encrypted messaging between AI agent sessions
 
 Usage:
-  agentmsg register [--verified] [--profile NAME]      Guest first; GitHub when required
+  agentmsg register [--name NAME] [--verified] [--profile NAME] Guest first
   agentmsg whoami                                       show your address card
+  agentmsg card [--qr]                                  print a compact address card
   agentmsg contact add NAME --sid SID --pubkey PK [--user ID]
   agentmsg contact list
   agentmsg policy set --mode MODE [--allow a,b] [--i-understand-the-risk]
@@ -101,6 +102,12 @@ function flagList(v: string | boolean | string[] | undefined): string[] {
 
 function emit(obj: unknown): void {
   process.stdout.write(JSON.stringify(obj, null, 2) + "\n");
+}
+
+function compactCard(s: Session): string {
+  const payload = { v: 1, name: s.nickname || undefined, sid: s.sessionId, pk: s.publicKey,
+    uid: s.githubUserId || undefined, exp: s.expiresAt || undefined };
+  return `am1:${Buffer.from(JSON.stringify(payload)).toString("base64url")}`;
 }
 function note(msg: string): void {
   process.stderr.write(msg + "\n");
@@ -205,6 +212,11 @@ export async function run(argv: string[]): Promise<number> {
       case "whoami": {
         const s = loadSessionOrExit(store, home);
         emit(sessionOutput(s, home));
+        return 0;
+      }
+      case "card": {
+        const s = loadSessionOrExit(store, home);
+        emit({ card: compactCard(s), nickname: s.nickname || undefined, session_id: s.sessionId, public_key: s.publicKey });
         return 0;
       }
       case "contact":
@@ -335,6 +347,7 @@ async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionSto
         }
         const kp = await generateKeypair();
         const session: Session = {
+          nickname: args.flags.name ? String(args.flags.name) : undefined,
           serverUrl: srv,
           sessionId: r.session_id,
           token: r.token,
@@ -360,6 +373,7 @@ async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionSto
       });
       const kp = await generateKeypair();
       const session: Session = {
+        nickname: args.flags.name ? String(args.flags.name) : undefined,
         serverUrl: srv,
         sessionId: result.session_id,
         token: result.token,
@@ -392,6 +406,19 @@ async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionSto
 function cmdContact(args: ReturnType<typeof parseArgs>, contacts: Contacts): number {
   const sub = args._[0];
   if (sub === "add") {
+    const compact = args.flags.card ? String(args.flags.card) : "";
+    if (compact) {
+      if (!compact.startsWith("am1:")) { note("error: invalid address card prefix"); return 2; }
+      try {
+        const p = JSON.parse(Buffer.from(compact.slice(4), "base64url").toString("utf8")) as { sid?: string; pk?: string; uid?: string };
+        if (!p.sid || !p.pk) throw new Error("missing sid or public key");
+        const name = args._[1];
+        if (!name) { note("usage: agentmsg contact add NAME --card CARD [--force]"); return 2; }
+        contacts.add(name, { sessionId: p.sid, publicKey: p.pk, githubUserId: p.uid || "" }, args.flags.force === true);
+        emit({ status: "contact_saved", name, fingerprint: fingerprint(p.pk) });
+        return 0;
+      } catch { note("error: invalid address card"); return 2; }
+    }
     const name = args._[1];
     if (!name || !args.flags.sid || !args.flags.pubkey) {
       note("usage: agentmsg contact add NAME --sid SID --pubkey PK [--user ID] [--force]");

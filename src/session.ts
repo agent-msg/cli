@@ -24,6 +24,7 @@ export interface AddressCard {
 }
 
 export interface Session {
+  nickname?: string;
   serverUrl: string;
   sessionId: string;
   token: string;

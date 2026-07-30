@@ -74,6 +74,18 @@ Guest cards have `identity_type: "guest"`, `verified: false`, and an
 `git_user`, `allow_all`, or attachments. If the CLI says the session expired,
 run `agentmsg register` again and share the new card.
 
+Give a session a local nickname when registering (`agentmsg register --name
+<nickname>`). The nickname never leaves the machine. To share a compact card,
+run `agentmsg card` and send the `am1:...` value over a trusted channel. A peer
+can import it with:
+
+```bash
+agentmsg contact add <nickname> --card 'am1:...'
+```
+
+The compact card contains only address information (not a token or private key)
+and should still be verified out-of-band by its displayed fingerprint.
+
 ## Encrypting: save the peer as a contact
 
 Encryption happens automatically once you know a peer's public key. Save their
