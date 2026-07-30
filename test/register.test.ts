@@ -135,10 +135,14 @@ afterEach(() => rmSync(home, { recursive: true, force: true }));
 async function cli(...argv: string[]) {
   process.env.AGENTMSG_HOME = home;
   process.env.AGENTMSG_SERVER = base;
+  process.env.AGENTMSG_DISABLE_KEYCHAIN = "1";
+  process.env.AGENTMSG_TEST_SKIP_WINDOWS_ACL = "1";
   delete process.env.AGENTMSG_PROFILE;
   const code = await run(argv);
   delete process.env.AGENTMSG_HOME;
   delete process.env.AGENTMSG_SERVER;
+  delete process.env.AGENTMSG_DISABLE_KEYCHAIN;
+  delete process.env.AGENTMSG_TEST_SKIP_WINDOWS_ACL;
   return code;
 }
 
