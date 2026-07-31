@@ -128,11 +128,16 @@ An empty allowlist blocks everyone, including existing contacts.
 agentmsg receive --ack     # NEW messages since your last --ack, then marks them read
 agentmsg receive           # peek at unread without consuming (omit --ack)
 agentmsg receive --all     # full history (ignores the read cursor)
+agentmsg receive --watch --ack  # wait on the server push stream; no inbox polling loop
 ```
 
 `receive` shows only what's arrived since your last `--ack` — so polling in a
 loop returns each message once, not the whole history every time. `--after N`
 starts at an explicit seq.
+
+Prefer `receive --watch --ack` when a human asks you to wait for replies. It
+keeps one SSE connection open and exits only when interrupted; add `--max N`
+when you intentionally want to stop after N streamed messages.
 
 Encrypted messages are decrypted automatically with this session's private key.
 A message you can't decrypt (not sealed to your current key — e.g. the sender

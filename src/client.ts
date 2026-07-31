@@ -121,6 +121,11 @@ export interface InboxResponse {
   has_more?: boolean;
 }
 
+export interface InboxStreamOptions {
+  after: number;
+  signal?: AbortSignal;
+}
+
 export interface SendResponse {
   msg_id: string;
   seq: number;
@@ -389,6 +394,75 @@ export class Client {
     let path = `/v1/inbox?after=${after}`;
     if (limit > 0) path += `&limit=${limit}`;
     return this.call("GET", path);
+  }
+
+  async *inboxStream(options: InboxStreamOptions): AsyncGenerator<InboxMessage> {
+    const headers: Record<string, string> = { Accept: "text/event-stream" };
+    if (this.token) headers["Authorization"] = `Bearer ${this.token}`;
+    const path = `/v1/inbox/stream?after=${options.after}`;
+    let resp: Response;
+    try {
+      resp = await fetch(this.serverUrl + path, { method: "GET", headers, signal: options.signal });
+    } catch (e) {
+      if ((e as Error).name === "AbortError") throw e;
+      throw new ApiError(0, "network_error", `request to ${path} failed`);
+    }
+    if (!resp.ok) {
+      const raw = await readCapped(resp, MAX_RESPONSE_BYTES).catch(() => "");
+      let code = "http_error";
+      let msg = raw;
+      try {
+        const e = JSON.parse(raw) as ApiErrorBody;
+        code = e.error || code;
+        msg = e.message || e.error || raw;
+      } catch {
+        /* non-JSON error body */
+      }
+      throw new ApiError(resp.status, code, msg);
+    }
+    if (!resp.body) throw new ApiError(0, "stream_unsupported", "server did not provide a response body");
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let event = "";
+    let data = "";
+    const flush = function* (): Generator<InboxMessage> {
+      if (event === "message" && data.trim()) yield JSON.parse(data) as InboxMessage;
+      event = "";
+      data = "";
+    };
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        for (;;) {
+          const idx = buffer.search(/\r?\n/);
+          if (idx < 0) break;
+          const line = buffer.slice(0, idx);
+          buffer = buffer.slice(buffer[idx] === "\r" && buffer[idx + 1] === "\n" ? idx + 2 : idx + 1);
+          if (line === "") {
+            yield* flush();
+          } else if (line.startsWith("event:")) {
+            event = line.slice(6).trim();
+          } else if (line.startsWith("data:")) {
+            data += (data ? "\n" : "") + line.slice(5).trimStart();
+          }
+        }
+      }
+      buffer += decoder.decode();
+      if (buffer.trim()) {
+        for (const line of buffer.split(/\r?\n/)) {
+          if (line === "") yield* flush();
+          else if (line.startsWith("event:")) event = line.slice(6).trim();
+          else if (line.startsWith("data:")) data += (data ? "\n" : "") + line.slice(5).trimStart();
+        }
+      }
+      yield* flush();
+    } finally {
+      await reader.cancel().catch(() => {});
+    }
   }
 
   ack(seq: number): Promise<unknown> {

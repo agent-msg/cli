@@ -11,15 +11,32 @@ import { run } from "../src/cli.js";
 let server: Server, base: string;
 let inbox: { seq: number; msg_id: string; from: string; text: string }[];
 let ackCursor: number;
+let streamClients: { after: number; res: any }[];
+
+function writeSse(res: any, m: { seq: number; msg_id: string; from: string; text: string }) {
+  res.write(`event: message\n`);
+  res.write(`data: ${JSON.stringify(m)}\n\n`);
+}
 
 beforeEach(async () => {
   inbox = [];
   ackCursor = 0;
+  streamClients = [];
   server = createServer((req, res) => {
+    const u = new URL(req.url || "/", "http://x");
+    if (u.pathname === "/v1/inbox/stream") {
+      const after = parseInt(u.searchParams.get("after") || "0", 10);
+      res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
+      for (const m of inbox.filter((msg) => msg.seq > after)) writeSse(res, m);
+      streamClients.push({ after, res });
+      req.on("close", () => {
+        streamClients = streamClients.filter((c) => c.res !== res);
+      });
+      return;
+    }
     let b = "";
     req.on("data", (c) => (b += c));
     req.on("end", () => {
-      const u = new URL(req.url || "/", "http://x");
       if (u.pathname === "/v1/register") {
         return res.end(JSON.stringify({ session_id: "s", token: "t", github_login: "u", github_user_id: "1" }));
       }
@@ -38,7 +55,14 @@ beforeEach(async () => {
   const a = server.address();
   base = `http://127.0.0.1:${typeof a === "object" && a ? a.port : 0}`;
 });
-afterEach(() => new Promise<void>((r) => server.close(() => r())));
+afterEach(
+  () =>
+    new Promise<void>((r) => {
+      for (const c of streamClients) c.res.end();
+      streamClients = [];
+      server.close(() => r());
+    }),
+);
 
 let home: string;
 beforeEach(() => (home = mkdtempSync(join(tmpdir(), "amsg-rcv-"))));
@@ -64,6 +88,17 @@ async function cliOut(...argv: string[]): Promise<{ code: number; out: any }> {
 }
 
 const seqs = (o: any) => (o?.messages ?? []).map((m: any) => m.seq);
+const pushInbox = (m: { seq: number; msg_id: string; from: string; text: string }) => {
+  inbox.push(m);
+  for (const c of streamClients) if (m.seq > c.after) writeSse(c.res, m);
+};
+async function waitForStreamClient() {
+  for (let i = 0; i < 100; i++) {
+    if (streamClients.length > 0) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("stream client did not connect");
+}
 
 describe("receive: unread-since-ack by default", () => {
   beforeEach(async () => {
@@ -112,5 +147,27 @@ describe("receive: unread-since-ack by default", () => {
     await cliOut("receive"); // no ack
     const { out } = await cliOut("receive"); // still unread
     expect(seqs(out)).toEqual([1, 2, 3]);
+  });
+
+  it("--watch streams unread messages over SSE and exits after --max", async () => {
+    const { out } = await cliOut("receive", "--watch", "--max", "1");
+    expect(out.message.seq).toBe(1);
+    expect(out.cursor).toBe(1);
+  });
+
+  it("--watch --ack advances the read cursor for streamed messages", async () => {
+    const { out } = await cliOut("receive", "--watch", "--ack", "--max", "1");
+    expect(out.message.seq).toBe(1);
+    expect(ackCursor).toBe(1);
+  });
+
+  it("--watch waits for live messages when the backlog is empty", async () => {
+    inbox = [];
+    const pending = cliOut("receive", "--watch", "--ack", "--after", "3", "--max", "1");
+    await waitForStreamClient();
+    pushInbox({ seq: 4, msg_id: "m4", from: "x", text: "four" });
+    const { out } = await pending;
+    expect(out.message.seq).toBe(4);
+    expect(ackCursor).toBe(4);
   });
 });
