@@ -37,7 +37,7 @@ Usage:
   agentmsg policy set --mode MODE [--allow a,b] [--i-understand-the-risk]
   agentmsg send --to NAME|SID --text TEXT [--file PATH] encrypts; --file attaches (Pro, E2EE)
   agentmsg download --msg ID --file NAME [--out PATH]   download + decrypt an attachment
-  agentmsg receive [--ack] [--all] [--after N]         unread since last --ack; decrypts
+  agentmsg receive [--ack] [--all] [--after N] [--watch] [--max N]  unread or stream live; decrypts
   agentmsg feedback --text TEXT [--kind bug|feature|other]  send feedback (10/day)
   agentmsg subscribe [--manage]                         Pro ($8/month, Stripe)
   agentmsg billing
@@ -590,6 +590,15 @@ async function cmdReceive(args: ReturnType<typeof parseArgs>, store: SessionStor
   else if (args.flags.after !== undefined) after = parseInt(String(args.flags.after), 10);
   else after = store.readCursor();
 
+  if (!Number.isFinite(after) || after < 0) {
+    note("error: --after must be a non-negative integer");
+    return 2;
+  }
+
+  if (args.flags.watch === true) {
+    return await cmdReceiveWatch(args, client, store, s, after);
+  }
+
   const page = await client.inboxPage(after);
   const messages = await Promise.all(
     page.messages.map(async (m) => {
@@ -604,6 +613,54 @@ async function cmdReceive(args: ReturnType<typeof parseArgs>, store: SessionStor
   }
   emit({ messages, cursor: page.cursor, next_cursor: page.next_cursor, has_more: page.has_more });
   return 0;
+}
+
+async function presentMessage(m: { seq: number; msg_id: string; from: string; text: string; enc?: string; attachments?: unknown[] }, s: Session) {
+  const d = await decryptOne(m, s);
+  return { seq: m.seq, msg_id: m.msg_id, from: m.from, ...d, attachments: m.attachments };
+}
+
+async function cmdReceiveWatch(
+  args: ReturnType<typeof parseArgs>,
+  client: Client,
+  store: SessionStore,
+  s: Session,
+  startAfter: number,
+): Promise<number> {
+  const maxRaw = args.flags.max === undefined ? 0 : parseInt(String(args.flags.max), 10);
+  if (!Number.isFinite(maxRaw) || maxRaw < 0) {
+    note("error: --max must be a non-negative integer");
+    return 2;
+  }
+
+  let after = startAfter;
+  let seen = 0;
+  let backoffMs = 500;
+  for (;;) {
+    try {
+      for await (const m of client.inboxStream({ after })) {
+        const out = await presentMessage(m, s);
+        after = m.seq;
+        emit({ message: out, cursor: after });
+        if (args.flags.ack === true) {
+          await client.ack(after);
+          store.writeCursor(after);
+        }
+        seen++;
+        if (maxRaw > 0 && seen >= maxRaw) return 0;
+      }
+      backoffMs = 500;
+    } catch (e) {
+      if ((e as Error).name === "AbortError") return 0;
+      if (e instanceof ApiError) {
+        if (e.status >= 400 && e.status < 500 && e.status !== 429) throw e;
+        if (e.retryAfter > 0) backoffMs = Math.max(backoffMs, e.retryAfter * 1000);
+      }
+      note(`receive stream disconnected; retrying in ${Math.ceil(backoffMs / 1000)}s`);
+      await new Promise<void>((resolve) => setTimeout(resolve, backoffMs));
+      backoffMs = Math.min(backoffMs * 2, 30_000);
+    }
+  }
 }
 
 // Feedback goes to the operator, NOT to a peer — so unlike `send` there is

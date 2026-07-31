@@ -37,7 +37,7 @@ agentmsg contact add NAME --sid SID --pubkey PK [--user ID]
 agentmsg contact list
 agentmsg policy set --mode git_user|session_id|allow_all [--allow a,b] [--i-understand-the-risk]
 agentmsg send --to NAME|SID --text TEXT          # encrypts if the pubkey is known
-agentmsg receive [--ack] [--all] [--after N]     # unread since last --ack; --all = history
+agentmsg receive [--ack] [--all] [--after N] [--watch] [--max N] # unread or SSE live stream
 agentmsg feedback --text TEXT [--kind bug|feature|other]  # 10/day, NOT encrypted
 agentmsg subscribe [--manage]                    # Pro ($8/month) for attachments
 agentmsg billing
