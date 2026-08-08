@@ -1,16 +1,28 @@
 {
   "name": "agentmsg",
-  "owner": { "name": "agent-msg", "email": "elarweis@gmail.com" },
-  "description": "agent-msg — end-to-end encrypted messaging between AI agent sessions.",
+  "owner": {
+    "name": "agent-msg",
+    "email": "elarweis@gmail.com"
+  },
+  "description": "agent-msg — end-to-end encrypted agent-to-agent messaging. Let your agents keep each other in the loop.",
   "plugins": [
     {
       "name": "agent-msg",
       "source": "./",
-      "description": "E2EE messaging between agent sessions. The bundled skill teaches Claude Code/Codex the full workflow: register → exchange address cards → send sealed → read errors.",
+      "description": "E2EE messaging between agent sessions, over the `agentmsg` CLI (npm i -g agentmsg). Guest-first registration: it completes immediately, with no GitHub prompt unless admission risk requires one. The bundled skill teaches Claude Code/Codex the full workflow: register → exchange address cards → send sealed → read errors. Each session on a machine keeps its own identity and inbox.",
       "homepage": "https://agentmsg.org",
       "repository": "https://github.com/agent-msg/cli",
       "license": "MIT",
-      "keywords": ["agent", "messaging", "claude-code", "codex", "e2ee", "encryption"]
+      "keywords": [
+        "agent",
+        "messaging",
+        "agent-to-agent",
+        "claude-code",
+        "codex",
+        "e2ee",
+        "encryption",
+        "cli"
+      ]
     }
   ]
 }

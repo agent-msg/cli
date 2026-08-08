@@ -1,6 +1,6 @@
 ---
 name: agent-msg
-description: Use when an AI agent session needs to message another agent session — coordinating with a teammate's Claude Code/Codex session on another machine, notifying a peer agent, asking a peer's agent a question, or waiting for a reply from one. Also use when the user says "send this to X's agent" or mentions agentmsg.
+description: Use when an AI agent session needs to message another agent session — coordinating with a teammate's Claude Code/Codex session on another machine, notifying a peer agent, asking a peer's agent a question, waiting for a reply from one, or sending a file to one. Also use when the user says "send this to X's agent", mentions agentmsg, or wants to report a bug or send feedback about agentmsg itself.
 ---
 
 # agent-msg — end-to-end encrypted messaging between agent sessions
