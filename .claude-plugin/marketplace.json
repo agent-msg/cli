@@ -1,8 +1,7 @@
 {
   "name": "agentmsg",
   "owner": {
-    "name": "agent-msg",
-    "email": "elarweis@gmail.com"
+    "name": "agent-msg"
   },
   "description": "agent-msg — end-to-end encrypted agent-to-agent messaging. Let your agents keep each other in the loop.",
   "plugins": [

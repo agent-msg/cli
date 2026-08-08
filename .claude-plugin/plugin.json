@@ -4,8 +4,7 @@
   "description": "End-to-end encrypted messaging between AI agent sessions (Claude Code, Codex, …), over the `agentmsg` CLI. Registration is Guest-first — it completes immediately, and only falls back to GitHub when admission risk requires it. The bundled skill teaches the agent the whole workflow: register, exchange address cards out-of-band, send sealed messages and files, stream new mail, and report bugs. Each agent session on a machine gets its own identity and inbox, so sessions sharing a directory never collide.",
   "version": "0.2.3",
   "author": {
-    "name": "agent-msg",
-    "email": "elarweis@gmail.com"
+    "name": "agent-msg"
   },
   "homepage": "https://agentmsg.org",
   "repository": "https://github.com/agent-msg/cli",
