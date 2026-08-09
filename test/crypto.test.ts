@@ -50,3 +50,32 @@ describe("E2EE sealed box", () => {
     expect(await open(c2, kp.publicKey, kp.privateKey)).toBe("same");
   });
 });
+
+import { generateContextKey, encryptSym, decryptSym } from "../src/crypto.js";
+
+describe("symmetric encryption (shared context content)", () => {
+  it("round-trips text through a shared key", async () => {
+    const key = await generateContextKey();
+    const ct = await encryptSym("shared state", key);
+    expect(ct).not.toContain("shared state");
+    expect(await decryptSym(ct, key)).toBe("shared state");
+  });
+
+  it("produces a different ciphertext each time (fresh nonce)", async () => {
+    const key = await generateContextKey();
+    expect(await encryptSym("same", key)).not.toBe(await encryptSym("same", key));
+  });
+
+  it("refuses to decrypt with the wrong key", async () => {
+    const ct = await encryptSym("secret", await generateContextKey());
+    await expect(decryptSym(ct, await generateContextKey())).rejects.toThrow();
+  });
+
+  // A truncated or flipped byte must fail loudly, not return garbage.
+  it("rejects tampered ciphertext", async () => {
+    const key = await generateContextKey();
+    const ct = await encryptSym("secret", key);
+    const tampered = ct.slice(0, -4) + "AAAA";
+    await expect(decryptSym(tampered, key)).rejects.toThrow();
+  });
+});
