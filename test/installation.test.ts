@@ -1,8 +1,10 @@
 import { chmodSync, lstatSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { randomBytes } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { InstallationStore } from "../src/installation.js";
+import { InstallationStore, installationBoxKeys, installationKeyFromSeed } from "../src/installation.js";
+import { open, seal } from "../src/crypto.js";
 
 let home: string;
 const savedDisableKeychain = process.env.AGENTMSG_DISABLE_KEYCHAIN;
@@ -46,5 +48,37 @@ describe("installation identity storage", () => {
     renameSync(keyPath, target);
     symlinkSync(target, keyPath);
     expect(() => new InstallationStore(home).loadOrCreate()).toThrow(/regular file/);
+  });
+});
+
+describe("installationBoxKeys", () => {
+  it("is deterministic: the same seed yields the same X25519 pair across calls", () => {
+    const seed = randomBytes(32);
+    const first = installationBoxKeys(seed);
+    const second = installationBoxKeys(seed);
+    expect(first.publicKey).toBe(second.publicKey);
+    expect(first.privateKey).toBe(second.privateKey);
+  });
+
+  it("is distinct: different seeds yield different X25519 pairs", () => {
+    const a = installationBoxKeys(randomBytes(32));
+    const b = installationBoxKeys(randomBytes(32));
+    expect(a.publicKey).not.toBe(b.publicKey);
+    expect(a.privateKey).not.toBe(b.privateKey);
+  });
+
+  it("is separated: the derived X25519 public key is not the Ed25519 public key from the same seed", () => {
+    const seed = randomBytes(32);
+    const boxKeys = installationBoxKeys(seed);
+    const signKey = installationKeyFromSeed(seed);
+    expect(boxKeys.publicKey).not.toBe(signKey.publicKey);
+  });
+
+  it("is functional: seal()/open() round-trips using the derived pair", async () => {
+    const seed = randomBytes(32);
+    const boxKeys = installationBoxKeys(seed);
+    const ciphertext = await seal("hello installation", boxKeys.publicKey);
+    const plaintext = await open(ciphertext, boxKeys.publicKey, boxKeys.privateKey);
+    expect(plaintext).toBe("hello installation");
   });
 });
