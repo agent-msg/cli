@@ -8,6 +8,100 @@ let home: string;
 beforeEach(() => (home = mkdtempSync(join(tmpdir(), "amsg-ctx-"))));
 afterEach(() => rmSync(home, { recursive: true, force: true }));
 
+import { createServer, Server } from "node:http";
+import { vi } from "vitest";
+import { run } from "../src/cli.js";
+
+let server: Server, base: string;
+let ctxVersion = 0;
+let stored = "";
+
+beforeEach(async () => {
+  ctxVersion = 0;
+  stored = "";
+  server = createServer((req, res) => {
+    let b = "";
+    req.on("data", (c) => (b += c));
+    req.on("end", () => {
+      // The /upload PUT carries binary ciphertext, not JSON — parsing it
+      // unconditionally would crash this handler and hang the request.
+      let body: any = {};
+      try {
+        body = b ? JSON.parse(b) : {};
+      } catch {
+        body = {};
+      }
+      res.setHeader("Content-Type", "application/json");
+      if (req.url === "/v1/register") {
+        return res.end(JSON.stringify({ session_id: "s1", token: "t1", github_login: "u", github_user_id: "1" }));
+      }
+      if (req.url === "/v1/contexts" && req.method === "POST") {
+        return res.end(JSON.stringify({ id: "c1", name_enc: body.name_enc, owner_uid: "1", epoch: 1, version: 0, bytes: 0, updated_at: "", role: "owner" }));
+      }
+      if (req.url === "/v1/contexts/c1" && req.method === "PUT") {
+        return res.end(JSON.stringify({ upload_url: base + "/upload", blob_key: "k" }));
+      }
+      if (req.url === "/upload") return res.end("{}");
+      if (req.url === "/v1/contexts/c1/commit") {
+        if (body.expected_version !== ctxVersion) {
+          res.statusCode = 409;
+          return res.end(JSON.stringify({ error: "version_conflict", current_version: ctxVersion }));
+        }
+        ctxVersion++;
+        return res.end(JSON.stringify({ id: "c1", name_enc: "", owner_uid: "1", epoch: 1, version: ctxVersion, bytes: 0, updated_at: "", role: "owner" }));
+      }
+      res.end("{}");
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, r));
+  const a = server.address();
+  base = `http://127.0.0.1:${typeof a === "object" && a ? a.port : 0}`;
+});
+afterEach(() => new Promise<void>((r) => server.close(() => r())));
+
+async function cli(...argv: string[]) {
+  process.env.AGENTMSG_HOME = home;
+  process.env.AGENTMSG_SERVER = base;
+  delete process.env.AGENTMSG_PROFILE;
+  const code = await run(argv);
+  delete process.env.AGENTMSG_HOME;
+  delete process.env.AGENTMSG_SERVER;
+  return code;
+}
+
+describe("agentmsg context", () => {
+  it("creates a context and saves its key locally", async () => {
+    expect(await cli("register", "--dev-user", "9", "--allow-insecure-http")).toBe(0);
+    const out: string[] = [];
+    const spy = vi.spyOn(process.stdout, "write").mockImplementation((c: any) => (out.push(String(c)), true));
+    const code = await cli("context", "create", "--name", "team notes");
+    spy.mockRestore();
+
+    expect(code).toBe(0);
+    expect(new ContextKeys(home).get("c1")).toBeTruthy(); // key stored for later reads
+    expect(out.join("")).not.toContain("team notes"); // the name goes out encrypted
+  });
+
+  // Conflicts are the normal path, so the CLI must surface everything the
+  // agent needs to merge instead of just failing.
+  it("reports a conflict with the data needed to merge", async () => {
+    expect(await cli("register", "--dev-user", "9", "--allow-insecure-http")).toBe(0);
+    await cli("context", "create", "--name", "n");
+    ctxVersion = 5; // someone else moved it while we were editing
+
+    const errs: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((c: any) => (errs.push(String(c)), true));
+    const code = await cli("context", "set", "--id", "c1", "--text", "mine", "--expect", "0");
+    spy.mockRestore();
+
+    expect(code).not.toBe(0);
+    const msg = errs.join("");
+    expect(msg).toMatch(/version_conflict|conflict/i);
+    expect(msg).toContain("5");           // the version we must rebase onto
+    expect(msg).toMatch(/context get/);   // tells the agent how to fetch it
+  });
+});
+
 describe("ContextKeys", () => {
   it("round-trips a key", () => {
     const k = new ContextKeys(home);

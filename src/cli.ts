@@ -2,8 +2,8 @@
 // agentmsg CLI. Encryption is the default: when the recipient's public key is
 // known (a saved contact), the message body is sealed on THIS machine before it
 // reaches the client, so the server only ever sees ciphertext.
-import { generateKeypair, seal, open, sealBytes, openBytes } from "./crypto.js";
-import { Client, ApiError } from "./client.js";
+import { generateKeypair, seal, open, sealBytes, openBytes, generateContextKey, encryptSym, decryptSym } from "./crypto.js";
+import { Client, ApiError, VersionConflict } from "./client.js";
 import {
   SessionStore,
   Session,
@@ -20,6 +20,7 @@ import { deviceFlowToken, DEFAULT_CLIENT_ID } from "./github.js";
 import { normalizeServerUrl } from "./serverurl.js";
 import { InstallationStore } from "./installation.js";
 import { CLI_VERSION, registerGuestFirst } from "./guest.js";
+import { ContextKeys } from "./context.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -43,6 +44,7 @@ Usage:
   agentmsg billing
   agentmsg unregister
   agentmsg skill install [--target claude|codex|all] [--force]
+  agentmsg context create|list|get|set|share|revoke  shared context (E2EE)
 
 Env: AGENTMSG_SERVER (default https://msg.agentmsg.org; read only by 'register' —
 other commands use the server saved in the session), AGENTMSG_HOME, AGENTMSG_PROFILE
@@ -221,6 +223,8 @@ export async function run(argv: string[]): Promise<number> {
       }
       case "contact":
         return cmdContact(args, contacts);
+      case "context":
+        return await cmdContext(args, store, home);
       case "policy":
         return await cmdPolicy(args, store, home);
       case "send":
@@ -704,6 +708,146 @@ function cliVersion(): string {
     }
   }
   return cachedVersion;
+}
+
+// Shared contexts. The document and its name are encrypted with a symmetric
+// key held locally; the server stores ciphertext and a version number.
+async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStore, home: string): Promise<number> {
+  const sub = args._[0];
+  const s = loadSessionOrExit(store, home);
+  const client = new Client(s.serverUrl, s.token);
+  const keys = new ContextKeys(home);
+
+  if (sub === "create") {
+    const name = args.flags.name !== undefined ? String(args.flags.name) : "";
+    if (!name) {
+      note("usage: agentmsg context create --name NAME");
+      return 2;
+    }
+    const key = await generateContextKey();
+    const c = await client.createContext(await encryptSym(name, key));
+    keys.save(c.id, key);
+    emit({ context_id: c.id, version: c.version, epoch: c.epoch });
+    return 0;
+  }
+
+  if (sub === "list") {
+    const list = await client.listContexts();
+    emit(await Promise.all(list.map(async (c) => {
+      const key = keys.get(c.id);
+      let name = "[no local key]";
+      if (key) {
+        try {
+          name = await decryptSym(c.name_enc, key);
+        } catch {
+          name = "[cannot decrypt — key may be from an older epoch]";
+        }
+      }
+      return { context_id: c.id, name, version: c.version, epoch: c.epoch, role: c.role };
+    })));
+    return 0;
+  }
+
+  if (sub === "get") {
+    const id = String(args.flags.id || "");
+    if (!id) {
+      note("usage: agentmsg context get --id ID");
+      return 2;
+    }
+    const c = await client.getContext(id);
+    const key = keys.get(id);
+    if (!key) {
+      note(`error: no local key for context ${id} — ask the owner to share it again.`);
+      return 1;
+    }
+    let text = "";
+    if (c.download_url) {
+      const ct = await client.download(new URL(c.download_url).pathname);
+      text = await decryptSym(Buffer.from(ct).toString("utf8"), key);
+    }
+    emit({ context_id: c.id, version: c.version, epoch: c.epoch, text });
+    return 0;
+  }
+
+  if (sub === "set") {
+    const id = String(args.flags.id || "");
+    const text = args.flags.text !== undefined ? String(args.flags.text) : "";
+    if (!id || !text) {
+      note("usage: agentmsg context set --id ID --text TEXT [--expect VERSION]");
+      return 2;
+    }
+    const key = keys.get(id);
+    if (!key) {
+      note(`error: no local key for context ${id} — ask the owner to share it again.`);
+      return 1;
+    }
+    const expect = args.flags.expect !== undefined
+      ? parseInt(String(args.flags.expect), 10)
+      : (await client.getContext(id)).version;
+
+    const ct = Buffer.from(await encryptSym(text, key), "utf8");
+    const sha256 = createHash("sha256").update(ct).digest("hex");
+    try {
+      const ticket = await client.putContext(id, expect, ct.length, sha256);
+      await client.uploadPut(ticket.upload_url, ct, "application/octet-stream");
+      const done = await client.commitContext(id, expect, ct.length, sha256);
+      emit({ context_id: id, version: done.version });
+      return 0;
+    } catch (e) {
+      if (e instanceof VersionConflict) {
+        // Conflicts are expected here, not exceptional. Tell the agent exactly
+        // how to fetch the version it missed so it can merge and retry.
+        note(`error: version_conflict — someone else wrote version ${e.currentVersion} while you were editing.`);
+        note(`   Fetch it, merge your change into it, then retry with the new version:`);
+        note(`      agentmsg context get --id ${id}`);
+        note(`      agentmsg context set --id ${id} --text <merged> --expect ${e.currentVersion}`);
+        return 1;
+      }
+      throw e;
+    }
+  }
+
+  if (sub === "share") {
+    const id = String(args.flags.id || "");
+    const to = String(args.flags.to || "");
+    const role = args.flags.role ? String(args.flags.role) : "writer";
+    if (!id || !to) {
+      note("usage: agentmsg context share --id ID --to NAME|SID [--role writer|reader]");
+      return 2;
+    }
+    const key = keys.get(id);
+    if (!key) {
+      note(`error: no local key for context ${id}.`);
+      return 1;
+    }
+    const contacts = new Contacts(home);
+    const addr = contacts.resolve(to);
+    if (!addr?.publicKey || !addr.githubUserId) {
+      note(`error: need a saved contact with a public key and numeric id for "${to}".`);
+      note(`   agentmsg contact add ${to} --sid <sid> --pubkey <pubkey> --user <id>`);
+      return 1;
+    }
+    await client.addContextMember(id, addr.githubUserId, role, addr.sessionId, await seal(key, addr.publicKey));
+    emit({ status: "shared", context_id: id, with: to, role });
+    return 0;
+  }
+
+  if (sub === "revoke") {
+    const id = String(args.flags.id || "");
+    const uid = String(args.flags.user || "");
+    if (!id || !uid) {
+      note("usage: agentmsg context revoke --id ID --user GITHUB_USER_ID");
+      return 2;
+    }
+    const c = await client.removeContextMember(id, uid);
+    note(">> access revoked and key epoch advanced.");
+    note(">> NOTE: this protects future writes only. Anything they already read is on their machine.");
+    emit({ context_id: id, epoch: c.epoch });
+    return 0;
+  }
+
+  note("usage: agentmsg context create|list|get|set|share|revoke");
+  return 2;
 }
 
 async function cmdSubscribe(args: ReturnType<typeof parseArgs>, store: SessionStore, home?: string): Promise<number> {
