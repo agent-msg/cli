@@ -168,6 +168,33 @@ export interface FeedbackResponse {
   remaining_today: number;
 }
 
+export interface ContextDTO {
+  id: string;
+  name_enc: string;
+  owner_uid: string;
+  epoch: number;
+  version: number;
+  bytes: number;
+  sha256?: string;
+  updated_at: string;
+  role?: string;
+  download_url?: string;
+  sealed_key?: string;
+}
+
+export interface PutContextResponse {
+  upload_url: string;
+  blob_key: string;
+}
+
+/** Thrown on 409 so callers can merge rather than parse an error string. */
+export class VersionConflict extends Error {
+  constructor(public currentVersion: number) {
+    super(`version conflict; current version is ${currentVersion}`);
+    this.name = "VersionConflict";
+  }
+}
+
 import { normalizeServerUrl } from "./serverurl.js";
 
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -492,5 +519,61 @@ export class Client {
 
   portal(): Promise<{ url: string }> {
     return this.call("POST", "/v1/billing/portal");
+  }
+
+  createContext(nameEnc: string): Promise<ContextDTO> {
+    return this.call("POST", "/v1/contexts", { name_enc: nameEnc });
+  }
+
+  listContexts(): Promise<ContextDTO[]> {
+    return this.call("GET", "/v1/contexts");
+  }
+
+  getContext(id: string): Promise<ContextDTO> {
+    return this.call("GET", `/v1/contexts/${encodeURIComponent(id)}`);
+  }
+
+  putContext(id: string, expectedVersion: number, bytes: number, sha256: string): Promise<PutContextResponse> {
+    return this.call("PUT", `/v1/contexts/${encodeURIComponent(id)}`, {
+      expected_version: expectedVersion, bytes, sha256,
+    });
+  }
+
+  /** Finalise a write. Throws VersionConflict when another writer won.
+   *
+   *  Note on extraction: call() parses the JSON error envelope and stores the
+   *  *whole* parsed body on ApiError.details (see callOnce's `details = e as
+   *  unknown as Record<string, unknown>`). For this endpoint's 409 body,
+   *  `{"error":"version_conflict","current_version":N}`, that means
+   *  `error.details.current_version` holds N directly. ApiError.message does
+   *  NOT contain the number here: callOnce sets `msg = e.message || e.error ||
+   *  raw`, and since this envelope has no `message` field, msg falls back to
+   *  `e.error`, i.e. the literal string "version_conflict" — no digits, no raw
+   *  JSON. A regex over error.message (as the brief drafted) would always match
+   *  nothing and silently default to version 0. Reading `details.current_version`
+   *  is the only reliable path given what call() actually produces.
+   */
+  async commitContext(id: string, expectedVersion: number, bytes: number, sha256: string): Promise<ContextDTO> {
+    try {
+      return await this.call<ContextDTO>("POST", `/v1/contexts/${encodeURIComponent(id)}/commit`, {
+        expected_version: expectedVersion, bytes, sha256,
+      });
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        const cv = e.details?.current_version;
+        throw new VersionConflict(typeof cv === "number" ? cv : Number(cv ?? 0));
+      }
+      throw e;
+    }
+  }
+
+  addContextMember(id: string, githubUserID: string, role: string, recipientSession: string, sealedKey: string): Promise<unknown> {
+    return this.call("POST", `/v1/contexts/${encodeURIComponent(id)}/members`, {
+      github_user_id: githubUserID, role, recipient_session: recipientSession, sealed_key: sealedKey,
+    });
+  }
+
+  removeContextMember(id: string, githubUserID: string): Promise<ContextDTO> {
+    return this.call("DELETE", `/v1/contexts/${encodeURIComponent(id)}/members/${encodeURIComponent(githubUserID)}`);
   }
 }
