@@ -711,29 +711,66 @@ function cliVersion(): string {
   return cachedVersion;
 }
 
+export interface ResolvedContextKey {
+  key: string | undefined;
+  /** True when we HAD a local key but it was for a different (or unknown)
+   *  epoch than the server's current one, and re-importing the current
+   *  envelope failed or wasn't possible — as opposed to never having had a
+   *  key for this context at all. Lets callers give a more useful message:
+   *  "wait for someone to redistribute the current key" reads very
+   *  differently from "ask the owner to share it with you". */
+  stale: boolean;
+}
+
 // Resolve a context's local decryption key, importing it from the server's
-// `sealed_key` envelope when we don't have one yet. This is the receive side
-// of member-to-member key distribution: a key gets sealed and uploaded by
-// whoever answers (see answerPendingContextKeys below), but until something
-// opens it and saves it locally, sharing never actually completes.
+// `sealed_key` envelope when we don't have a CURRENT one. This is the
+// receive side of member-to-member key distribution: a key gets sealed and
+// uploaded by whoever answers (see answerPendingContextKeys below), but
+// until something opens it and saves it locally, sharing never completes.
+//
+// Critical: a locally cached key is NEVER trusted just because it exists.
+// ContextKeys has no way to know whether the server has since moved to a
+// newer epoch (e.g. another member ran `revoke`, which now genuinely
+// rotates — see that command below), so every call here re-checks the
+// server's current epoch and discards + re-imports a stale local key. The
+// alternative — trusting whatever is on disk — turns a successful rotation
+// into a permanent, silent lockout for every remaining member: exactly the
+// failure mode a real rotation is supposed to prevent, not cause.
 async function resolveContextKey(
   client: Client,
   keys: ContextKeys,
   boxKeys: InstallationBoxKeys,
   id: string,
   dto?: ContextDTO,
-): Promise<string | undefined> {
-  const local = keys.get(id);
-  if (local) return local;
+): Promise<ResolvedContextKey> {
+  const entry = keys.getEntry(id);
   const c = dto ?? (await client.getContext(id).catch(() => undefined));
-  if (!c?.sealed_key) return undefined;
-  try {
-    const key = await open(c.sealed_key, boxKeys.publicKey, boxKeys.privateKey);
-    keys.save(id, key);
-    return key;
-  } catch {
-    return undefined; // not addressed to us, or tampered — treat as absent
+  if (!c) {
+    // Can't reach the server to check freshness — use whatever we have
+    // locally rather than fail outright on a transient network error.
+    return { key: entry?.key, stale: false };
   }
+  if (entry && entry.epoch === c.epoch) return { key: entry.key, stale: false };
+  // No local key, or one whose epoch doesn't confirm as current — including
+  // a legacy entry with no epoch recorded at all, which is always treated as
+  // stale rather than trusted. Try to import the current envelope.
+  if (c.sealed_key) {
+    try {
+      const key = await open(c.sealed_key, boxKeys.publicKey, boxKeys.privateKey);
+      keys.save(id, key, c.epoch);
+      return { key, stale: false };
+    } catch {
+      // not addressed to us, or tampered — fall through to "stale"
+    }
+  }
+  return { key: undefined, stale: entry !== undefined };
+}
+
+function noLocalKeyMessage(id: string, resolved: ResolvedContextKey): string {
+  return resolved.stale
+    ? `error: your local key for context ${id} is from an older epoch, and no current envelope has reached you yet. ` +
+      `Wait for another organization member to run an agentmsg command (piggyback answering delivers it automatically), then retry.`
+    : `error: no local key for context ${id} — ask the owner to share it again.`;
 }
 
 // Piggyback answering: rides on any context command the agent already runs.
@@ -803,7 +840,7 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
     }
     const key = await generateContextKey();
     const c = await client.createContext(await encryptSym(name, key));
-    keys.save(c.id, key);
+    keys.save(c.id, key, c.epoch);
     emit({ context_id: c.id, version: c.version, epoch: c.epoch });
     return 0;
   }
@@ -811,11 +848,15 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
   if (sub === "list") {
     const list = await client.listContexts();
     emit(await Promise.all(list.map(async (c) => {
-      const key = keys.get(c.id);
+      const entry = keys.getEntry(c.id);
       let name = "[no local key]";
-      if (key) {
+      if (entry && entry.epoch !== undefined && entry.epoch !== c.epoch) {
+        // We know for certain this key is stale (unlike the legacy/unknown-
+        // epoch case below, which is only a guess after a failed decrypt).
+        name = `[cannot decrypt — key is from an older epoch; run 'agentmsg context get --id ${c.id}' to try re-importing]`;
+      } else if (entry) {
         try {
-          name = await decryptSym(c.name_enc, key);
+          name = await decryptSym(c.name_enc, entry.key);
         } catch {
           name = "[cannot decrypt — key may be from an older epoch]";
         }
@@ -832,15 +873,25 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
       return 2;
     }
     const c = await client.getContext(id);
-    const key = await resolveContextKey(client, keys, boxKeys, id, c);
-    if (!key) {
-      note(`error: no local key for context ${id} — ask the owner to share it again.`);
+    const resolved = await resolveContextKey(client, keys, boxKeys, id, c);
+    if (!resolved.key) {
+      note(noLocalKeyMessage(id, resolved));
       return 1;
     }
+    const key = resolved.key;
     let text = "";
     if (c.download_url) {
       const ct = await client.download(new URL(c.download_url).pathname);
-      text = await decryptSym(Buffer.from(ct).toString("utf8"), key);
+      try {
+        text = await decryptSym(Buffer.from(ct).toString("utf8"), key);
+      } catch {
+        // Epoch matched, but the bytes didn't decrypt anyway — e.g. a
+        // rotation that re-keyed but never finished re-encrypting content.
+        // Never let the raw crypto exception reach the user.
+        note(`error: could not decrypt content for context ${id} — the local key does not match the last write. ` +
+          `This can happen mid-rotation; try again shortly, or ask the owner to confirm 'context revoke' completed.`);
+        return 1;
+      }
     }
     emit({ context_id: c.id, version: c.version, epoch: c.epoch, text });
     return 0;
@@ -853,11 +904,12 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
       note("usage: agentmsg context set --id ID --text TEXT [--expect VERSION]");
       return 2;
     }
-    const key = await resolveContextKey(client, keys, boxKeys, id);
-    if (!key) {
-      note(`error: no local key for context ${id} — ask the owner to share it again.`);
+    const resolved = await resolveContextKey(client, keys, boxKeys, id);
+    if (!resolved.key) {
+      note(noLocalKeyMessage(id, resolved));
       return 1;
     }
+    const key = resolved.key;
     const expect = args.flags.expect !== undefined
       ? parseInt(String(args.flags.expect), 10)
       : (await client.getContext(id)).version;
@@ -892,11 +944,12 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
       note("usage: agentmsg context share --id ID --to NAME|SID [--role writer|reader]");
       return 2;
     }
-    const key = await resolveContextKey(client, keys, boxKeys, id);
-    if (!key) {
-      note(`error: no local key for context ${id}.`);
+    const resolved = await resolveContextKey(client, keys, boxKeys, id);
+    if (!resolved.key) {
+      note(noLocalKeyMessage(id, resolved));
       return 1;
     }
+    const key = resolved.key;
     const addr = contacts.resolve(to);
     if (!addr?.publicKey || !addr.githubUserId) {
       note(`error: need a saved contact with a public key and numeric id for "${to}".`);
@@ -925,7 +978,7 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
       note("usage: agentmsg context revoke --id ID --user GITHUB_USER_ID");
       return 2;
     }
-    const oldKey = keys.get(id);
+    const oldEntry = keys.getEntry(id);
     const c = await client.removeContextMember(id, uid);
 
     // Honest revoke: bumping the epoch alone has zero cryptographic effect —
@@ -937,20 +990,31 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
     // and print no claim of protection — a false security promise is worse
     // than a missing feature.
     let rotated = false;
-    if (oldKey) {
+    if (oldEntry) {
+      const freshKey = await generateContextKey();
+      // Commit the fresh key to LOCAL storage before any of the network
+      // calls below that could fail partway through. This is what keeps
+      // local state from ever lagging behind the server: even if content
+      // re-encryption or delivery to other members fails, we already hold
+      // the correct key for the new epoch (c.epoch, from the removal above,
+      // which already bumped it) — so resolveContextKey's epoch check finds
+      // a match on the very next command instead of a stale key nobody can
+      // recover from. Import-on-read (the fix above) is what makes it safe
+      // to commit here first: a mid-rotation crash now degrades to "retry",
+      // not "permanently locked out."
+      keys.save(id, freshKey, c.epoch);
       try {
-        const freshKey = await generateContextKey();
         const full = await client.getContext(id);
-        if (full.download_url) {
+        if (full.download_url && oldEntry.key) {
           const ct = await client.download(new URL(full.download_url).pathname);
-          const plaintext = await decryptSym(Buffer.from(ct).toString("utf8"), oldKey);
+          const plaintext = await decryptSym(Buffer.from(ct).toString("utf8"), oldEntry.key);
           const newCt = Buffer.from(await encryptSym(plaintext, freshKey), "utf8");
           const sha256 = createHash("sha256").update(newCt).digest("hex");
           const ticket = await client.putContext(id, full.version, newCt.length, sha256);
           await client.uploadPut(ticket.upload_url, newCt, "application/octet-stream");
           await client.commitContext(id, full.version, newCt.length, sha256);
         }
-        // Deliver the fresh key to OURSELVES first: the server trusts the
+        // Deliver the fresh key to OURSELVES too: the server trusts the
         // owner unconditionally for this (see handleRotateKeys), and doing
         // so is what lets GET /v1/contexts/pending see us as a keyholder for
         // the new epoch — which is how we then discover the remaining
@@ -958,12 +1022,19 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
         if (selfInstallationId) {
           const selfSealed = await seal(freshKey, boxKeys.publicKey);
           await client.uploadContextKeys(id, [{ recipient_installation: selfInstallationId, sealed_key: selfSealed }]);
+        } else {
+          // Minor but real: don't silently claim success while skipping our
+          // own delivery. The rotation itself (fresh key + re-encrypted
+          // content, both already done above) is still genuine, but other
+          // sessions on this machine won't be able to import it from the
+          // server until this resolves.
+          note("warning: could not resolve our own installation id, so the fresh key was not uploaded for the server to hand to other sessions on this machine. It is saved locally here, though.");
         }
-        keys.save(id, freshKey);
         await answerPendingContextKeys(client, keys, contacts, selfInstallationId);
         rotated = true;
       } catch (e) {
-        note(`warning: key rotation after revoke did not complete (${(e as Error).message}). Epoch was still advanced.`);
+        note(`warning: key rotation after revoke did not fully complete (${(e as Error).message}). ` +
+          `The epoch was advanced and a fresh key is already saved locally here, so re-running should finish the job.`);
       }
     }
 

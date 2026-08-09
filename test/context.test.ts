@@ -18,6 +18,7 @@ import { run } from "../src/cli.js";
 
 let server: Server, base: string;
 let ctxVersion = 0;
+let ctxEpoch = 1;
 let lastNameEnc = "";
 // Test-controlled fixtures for the new pending/keys/get-content endpoints.
 let ctxSealedKey = ""; // sealed_key returned by GET /v1/contexts/c1
@@ -29,6 +30,7 @@ let removedMembers: string[] = [];
 
 beforeEach(async () => {
   ctxVersion = 0;
+  ctxEpoch = 1;
   lastNameEnc = "";
   ctxSealedKey = "";
   ctxDownloadContent = "";
@@ -61,10 +63,11 @@ beforeEach(async () => {
       }
       if (req.url === "/v1/contexts" && req.method === "POST") {
         lastNameEnc = String(body.name_enc ?? "");
-        return res.end(JSON.stringify({ id: "c1", name_enc: body.name_enc, owner_uid: "1", epoch: 1, version: 0, bytes: 0, updated_at: "", role: "owner" }));
+        ctxEpoch = 1;
+        return res.end(JSON.stringify({ id: "c1", name_enc: body.name_enc, owner_uid: "1", epoch: ctxEpoch, version: 0, bytes: 0, updated_at: "", role: "owner" }));
       }
       if (req.url === "/v1/contexts" && req.method === "GET") {
-        return res.end(JSON.stringify([{ id: "c1", name_enc: lastNameEnc, owner_uid: "1", epoch: 1, version: ctxVersion, bytes: ctxHasContent ? 1 : 0, updated_at: "", role: "owner" }]));
+        return res.end(JSON.stringify([{ id: "c1", name_enc: lastNameEnc, owner_uid: "1", epoch: ctxEpoch, version: ctxVersion, bytes: ctxHasContent ? 1 : 0, updated_at: "", role: "owner" }]));
       }
       if (req.url === "/v1/contexts/pending" && req.method === "GET") {
         return res.end(JSON.stringify(pendingList));
@@ -75,12 +78,12 @@ beforeEach(async () => {
       }
       if (req.url?.startsWith("/v1/contexts/c1/members/") && req.method === "DELETE") {
         removedMembers.push(decodeURIComponent(req.url.slice("/v1/contexts/c1/members/".length)));
-        ctxVersion = ctxVersion; // unchanged by removal
-        return res.end(JSON.stringify({ id: "c1", name_enc: "", owner_uid: "1", epoch: 2, version: ctxVersion, bytes: ctxHasContent ? 1 : 0, updated_at: "", role: "owner" }));
+        ctxEpoch++;
+        return res.end(JSON.stringify({ id: "c1", name_enc: "", owner_uid: "1", epoch: ctxEpoch, version: ctxVersion, bytes: ctxHasContent ? 1 : 0, updated_at: "", role: "owner" }));
       }
       if (req.url === "/v1/contexts/c1" && req.method === "GET") {
         return res.end(JSON.stringify({
-          id: "c1", name_enc: "", owner_uid: "1", epoch: 1, version: ctxVersion,
+          id: "c1", name_enc: "", owner_uid: "1", epoch: ctxEpoch, version: ctxVersion,
           bytes: ctxHasContent ? 1 : 0, updated_at: "", role: "owner",
           download_url: ctxHasContent ? base + "/download-content" : undefined,
           sealed_key: ctxSealedKey || undefined,
@@ -103,7 +106,7 @@ beforeEach(async () => {
           return res.end(JSON.stringify({ error: "version_conflict", current_version: ctxVersion }));
         }
         ctxVersion++;
-        return res.end(JSON.stringify({ id: "c1", name_enc: "", owner_uid: "1", epoch: 1, version: ctxVersion, bytes: 0, updated_at: "", role: "owner" }));
+        return res.end(JSON.stringify({ id: "c1", name_enc: "", owner_uid: "1", epoch: ctxEpoch, version: ctxVersion, bytes: 0, updated_at: "", role: "owner" }));
       }
       res.end("{}");
     });
@@ -192,6 +195,76 @@ describe("agentmsg context", () => {
     expect(JSON.parse(out.join(""))).toMatchObject({ context_id: "c1", text: "secret plan" });
     // The imported key must now be saved locally, for next time.
     expect(new ContextKeys(home).get("c1")).toBe(contextKey);
+  });
+
+  // Critical A (review fix): ContextKeys had no notion of epoch, so a
+  // locally cached key was trusted forever — even after a real rotation
+  // (revoke) moved the server past it. A legitimate remaining member would
+  // then be permanently unable to read anything written after the
+  // rotation, with no command able to recover. The fix: compare the local
+  // key's epoch against the server's current one on every read, and
+  // discard + re-import from `sealed_key` when they differ.
+  it("discards a stale local key and re-imports when the server has moved to a newer epoch", async () => {
+    expect(await cli("register", "--dev-user", "9", "--allow-insecure-http")).toBe(0);
+    await cli("context", "create", "--name", "n");
+    const staleKey = new ContextKeys(home).get("c1")!;
+
+    // Simulate the server having rotated to epoch 2 (e.g. another member ran
+    // `revoke`) while this session was away: a fresh key sealed to OUR
+    // installation, and content re-encrypted under it.
+    const installation = new InstallationStore(home).loadOrCreate();
+    const boxKeys = installationBoxKeys(installation.seed);
+    const freshKey = await generateContextKey();
+    ctxEpoch = 2;
+    ctxSealedKey = await seal(freshKey, boxKeys.publicKey);
+    ctxDownloadContent = await encryptSym("post-rotation content", freshKey);
+    ctxHasContent = true;
+
+    const out: string[] = [];
+    const spy = vi.spyOn(process.stdout, "write").mockImplementation((c: any) => (out.push(String(c)), true));
+    const code = await cli("context", "get", "--id", "c1");
+    spy.mockRestore();
+
+    expect(code).toBe(0);
+    expect(JSON.parse(out.join(""))).toMatchObject({ context_id: "c1", epoch: 2, text: "post-rotation content" });
+    const newLocalKey = new ContextKeys(home).get("c1");
+    expect(newLocalKey).toBe(freshKey);
+    expect(newLocalKey).not.toBe(staleKey);
+  });
+
+  it("gives a clear message (not a raw exception) when a stale key cannot be re-imported", async () => {
+    expect(await cli("register", "--dev-user", "9", "--allow-insecure-http")).toBe(0);
+    await cli("context", "create", "--name", "n");
+    // Rotated elsewhere, but no envelope has reached us yet.
+    ctxEpoch = 2;
+    ctxSealedKey = "";
+
+    const errs: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((c: any) => (errs.push(String(c)), true));
+    const code = await cli("context", "get", "--id", "c1");
+    spy.mockRestore();
+
+    expect(code).toBe(1);
+    expect(errs.join("")).toMatch(/older epoch/i);
+  });
+
+  it("gives a clear message instead of an uncaught exception when content fails to decrypt", async () => {
+    expect(await cli("register", "--dev-user", "9", "--allow-insecure-http")).toBe(0);
+    await cli("context", "create", "--name", "n");
+    // Epoch matches (so the key looks fresh) but the actual bytes on the
+    // "server" were encrypted under a different key — e.g. a partial
+    // rotation failure. `get` must not let decryptSym's raw exception
+    // through.
+    ctxHasContent = true;
+    ctxDownloadContent = await encryptSym("secret", await generateContextKey());
+
+    const errs: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((c: any) => (errs.push(String(c)), true));
+    const code = await cli("context", "get", "--id", "c1");
+    spy.mockRestore();
+
+    expect(code).toBe(1);
+    expect(errs.join("")).toMatch(/could not decrypt/i);
   });
 
   // R4(b) — piggyback answering: any context command should, in passing,
