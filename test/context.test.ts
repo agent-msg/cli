@@ -27,6 +27,7 @@ let ctxHasContent = false;
 let pendingList: unknown[] = [];
 let uploadedEnvelopes: { context_id: string; envelopes: { recipient_installation: string; sealed_key: string }[] }[] = [];
 let removedMembers: string[] = [];
+let addedMembers: { github_user_id: string; role: string; recipient_installation: string; sealed_key: string }[] = [];
 
 beforeEach(async () => {
   ctxVersion = 0;
@@ -38,6 +39,7 @@ beforeEach(async () => {
   pendingList = [];
   uploadedEnvelopes = [];
   removedMembers = [];
+  addedMembers = [];
   server = createServer((req, res) => {
     let b = "";
     req.on("data", (c) => (b += c));
@@ -75,6 +77,14 @@ beforeEach(async () => {
       if (req.url === "/v1/contexts/c1/keys" && req.method === "POST") {
         uploadedEnvelopes.push({ context_id: "c1", envelopes: body.envelopes || [] });
         return res.end(JSON.stringify({ status: "stored" }));
+      }
+      if (req.url === "/v1/contexts/c1/members" && req.method === "POST") {
+        addedMembers.push({
+          github_user_id: String(body.github_user_id ?? ""), role: String(body.role ?? ""),
+          recipient_installation: String(body.recipient_installation ?? ""),
+          sealed_key: String(body.sealed_key ?? ""),
+        });
+        return res.end(JSON.stringify({ status: "added" }));
       }
       if (req.url?.startsWith("/v1/contexts/c1/members/") && req.method === "DELETE") {
         removedMembers.push(decodeURIComponent(req.url.slice("/v1/contexts/c1/members/".length)));
@@ -275,10 +285,21 @@ describe("agentmsg context", () => {
     await cli("context", "create", "--name", "n"); // we now hold c1's key locally
     const ourKey = new ContextKeys(home).get("c1")!;
 
-    // Bob is a known contact (out-of-band exchanged public key) who is a
-    // pending member of c1: added, but with no envelope yet.
-    const bob = await generateKeypair();
-    new Contacts(home).add("bob", { sessionId: "s-bob", publicKey: bob.publicKey, githubUserId: "42" });
+    // Bob is a known contact on a genuinely DIFFERENT installation: derive
+    // his box key from a distinct seed, exactly as a real second machine
+    // would, and give him an unrelated session messaging keypair too — the
+    // whole point of R4b is that these are NOT interchangeable. Sealing to
+    // bob's messaging key (as the pre-fix code did) would produce an
+    // envelope his installation box private key could never open; a test
+    // that fabricated one keypair and used it for both roles would never
+    // have caught that.
+    const bobSeed = Buffer.alloc(32, 0x42);
+    const bobBoxKeys = installationBoxKeys(bobSeed);
+    const bobSessionKeys = await generateKeypair();
+    new Contacts(home).add("bob", {
+      sessionId: "s-bob", publicKey: bobSessionKeys.publicKey, githubUserId: "42",
+      installationBoxKey: bobBoxKeys.publicKey,
+    });
     pendingList = [{ context_id: "c1", epoch: 1, github_user_id: "42", role: "writer", recipient_installation: "install-bob" }];
 
     const code = await cli("context", "list"); // an ordinary command, not a new one
@@ -289,10 +310,70 @@ describe("agentmsg context", () => {
     expect(uploadedEnvelopes[0].envelopes).toHaveLength(1);
     const envelope = uploadedEnvelopes[0].envelopes[0];
     expect(envelope.recipient_installation).toBe("install-bob");
-    // Prove it is genuinely usable by Bob: his private key opens it, and it
-    // is the real context key, not garbage.
-    const opened = await open(envelope.sealed_key, bob.publicKey, bob.privateKey);
+    // Prove it is genuinely usable by Bob on HIS machine: his installation
+    // box private key (derived independently from his own seed, never
+    // shared with the sealer) opens it, and it is the real context key.
+    const opened = await open(envelope.sealed_key, bobBoxKeys.publicKey, bobBoxKeys.privateKey);
     expect(opened).toBe(ourKey);
+    // Negative pin: bob's SESSION messaging key must NOT be able to open it
+    // — sealing to the wrong key type must fail, not silently "work".
+    await expect(open(envelope.sealed_key, bobSessionKeys.publicKey, bobSessionKeys.privateKey)).rejects.toThrow();
+  });
+
+  // R4b: 'share' must seal to the recipient's INSTALLATION box key, derived
+  // from a genuinely different installation seed — the way a real second
+  // machine's key actually comes into being — not to a keypair fabricated
+  // once and reused for both sealing and opening (that anti-pattern is
+  // exactly what let the original bug ship: sealing to contact.publicKey,
+  // the recipient's ephemeral SESSION messaging key, produced an envelope
+  // their installation box private key could never open).
+  it("share seals to the recipient's installation box key, openable only by that installation's derived private key", async () => {
+    expect(await cli("register", "--dev-user", "9", "--allow-insecure-http")).toBe(0);
+    await cli("context", "create", "--name", "n");
+    const ourKey = new ContextKeys(home).get("c1")!;
+
+    // Alice's installation lives on a wholly separate seed from ours.
+    const aliceSeed = Buffer.alloc(32, 0x99);
+    const aliceBoxKeys = installationBoxKeys(aliceSeed);
+    const aliceSessionKeys = await generateKeypair(); // her unrelated messaging keypair
+    new Contacts(home).add("alice", {
+      sessionId: "s-alice", publicKey: aliceSessionKeys.publicKey, githubUserId: "7",
+      installationBoxKey: aliceBoxKeys.publicKey,
+    });
+
+    const code = await cli("context", "share", "--id", "c1", "--to", "alice");
+    expect(code).toBe(0);
+
+    expect(addedMembers).toHaveLength(1);
+    expect(addedMembers[0].github_user_id).toBe("7");
+    // The envelope is genuinely usable on Alice's machine: her installation
+    // box private key (derived independently, from HER seed) opens it.
+    const opened = await open(addedMembers[0].sealed_key, aliceBoxKeys.publicKey, aliceBoxKeys.privateKey);
+    expect(opened).toBe(ourKey);
+    // Negative pin: sealing to the SESSION public key and trying to open
+    // with the installation box private key must fail — that is precisely
+    // the distinction the original bug violated.
+    const wrongSeal = await seal(ourKey, aliceSessionKeys.publicKey);
+    await expect(open(wrongSeal, aliceBoxKeys.publicKey, aliceBoxKeys.privateKey)).rejects.toThrow();
+  });
+
+  it("share refuses (with a clear message, not a crash) when the contact predates installation keys", async () => {
+    expect(await cli("register", "--dev-user", "9", "--allow-insecure-http")).toBe(0);
+    await cli("context", "create", "--name", "n");
+    // A contact saved before R4b has no installationBoxKey on disk.
+    new Contacts(home).add("alice", {
+      sessionId: "s-alice", publicKey: (await generateKeypair()).publicKey, githubUserId: "7",
+      installationBoxKey: "",
+    });
+
+    const errs: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((c: any) => (errs.push(String(c)), true));
+    const code = await cli("context", "share", "--id", "c1", "--to", "alice");
+    spy.mockRestore();
+
+    expect(code).toBe(1);
+    expect(errs.join("")).toMatch(/predates installation keys/i);
+    expect(addedMembers).toHaveLength(0);
   });
 
   it("never lets a failed pending-answer break the command the user asked for", async () => {

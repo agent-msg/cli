@@ -50,6 +50,7 @@ describe("Guest-first registration orchestration", () => {
             expires_at: ch.guest_expires_at,
             public_key: installation.publicKey,
             signature: String(input.address_card_signature),
+            installation_box_key: String(input.installation_box_key),
           },
         };
       }),
@@ -59,6 +60,7 @@ describe("Guest-first registration orchestration", () => {
       installation,
       serverOrigin: origin,
       note: () => undefined,
+      installationBoxKey: "test-installation-box-key",
     });
     expect(result.identity_type).toBe("guest");
     expect(request.pow_solution).toBe("");
@@ -95,11 +97,15 @@ describe("Guest-first registration orchestration", () => {
             expires_at: ch.guest_expires_at,
             public_key: installation.publicKey,
             signature: String(input.address_card_signature),
+            installation_box_key: String(input.installation_box_key),
           },
         };
       }),
     } as unknown as Client;
-    await registerGuestFirst({ client, installation, serverOrigin: origin, note: () => undefined });
+    await registerGuestFirst({
+      client, installation, serverOrigin: origin, note: () => undefined,
+      installationBoxKey: "test-installation-box-key",
+    });
     expect(solution).toMatch(/^(0|[1-9]\d*)$/);
   });
 
@@ -116,7 +122,7 @@ describe("Guest-first registration orchestration", () => {
       }),
     } as unknown as Client;
     await expect(
-      registerGuestFirst({ client, installation, serverOrigin: origin, note: () => undefined }),
+      registerGuestFirst({ client, installation, serverOrigin: origin, note: () => undefined, installationBoxKey: "" }),
     ).rejects.toThrow(/flow id/);
   });
 
@@ -147,7 +153,7 @@ describe("Guest-first registration orchestration", () => {
       })),
     } as unknown as Client;
     await expect(
-      registerGuestFirst({ client, installation, serverOrigin: origin, note: () => undefined }),
+      registerGuestFirst({ client, installation, serverOrigin: origin, note: () => undefined, installationBoxKey: "" }),
     ).rejects.toThrow(/response binding mismatch/);
   });
 });

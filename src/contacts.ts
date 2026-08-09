@@ -10,6 +10,14 @@ export interface Address {
   sessionId: string;
   publicKey: string;
   githubUserId: string;
+  // installationBoxKey is the contact's installation-derived X25519 public
+  // key (see installation-box.ts) — the key shared-context envelopes must be
+  // sealed to. Deliberately kept separate from publicKey (that contact's
+  // ephemeral per-session messaging keypair, used for direct-message
+  // seal/open): sealing a context key to publicKey produces an envelope the
+  // recipient's context code can never open — see R4b. Empty for contacts
+  // saved before this field existed, or from a peer whose card predates it.
+  installationBoxKey: string;
 }
 
 export interface NamedAddress extends Address {
@@ -42,11 +50,25 @@ export class Contacts {
       if ((e as NodeJS.ErrnoException).code === "ENOENT") return {};
       throw new Error(`cannot read contacts (${(e as Error).message})`);
     }
+    let parsed: Record<string, Partial<Address>>;
     try {
-      return JSON.parse(raw) as Record<string, Address>;
+      parsed = JSON.parse(raw) as Record<string, Partial<Address>>;
     } catch {
       throw new Error(`contacts file is corrupt: ${this.file}`);
     }
+    // A contact saved before installationBoxKey existed simply lacks the
+    // field on disk; default it to "" rather than leaving it `undefined`, so
+    // every caller can treat "no box key" uniformly (see the field's doc).
+    const out: Record<string, Address> = {};
+    for (const [name, a] of Object.entries(parsed)) {
+      out[name] = {
+        sessionId: a.sessionId || "",
+        publicKey: a.publicKey || "",
+        githubUserId: a.githubUserId || "",
+        installationBoxKey: a.installationBoxKey || "",
+      };
+    }
+    return out;
   }
 
   /**
@@ -78,7 +100,7 @@ export class Contacts {
     if (!nameOrSid) return null;
     const saved = this.read()[nameOrSid];
     if (saved) return saved;
-    return { sessionId: nameOrSid, publicKey: "", githubUserId: "" };
+    return { sessionId: nameOrSid, publicKey: "", githubUserId: "", installationBoxKey: "" };
   }
 
   list(): NamedAddress[] {

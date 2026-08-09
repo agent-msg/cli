@@ -34,7 +34,7 @@ Usage:
   agentmsg register [--name NAME] [--verified] [--profile NAME] Guest first
   agentmsg whoami                                       show your address card
   agentmsg card [--qr]                                  print a compact address card
-  agentmsg contact add NAME --sid SID --pubkey PK [--user ID]
+  agentmsg contact add NAME --sid SID --pubkey PK [--user ID] [--installation-box-key KEY]
   agentmsg contact list
   agentmsg policy set --mode MODE [--allow a,b] [--i-understand-the-risk]
   agentmsg send --to NAME|SID --text TEXT [--file PATH] encrypts; --file attaches (Pro, E2EE)
@@ -109,7 +109,7 @@ function emit(obj: unknown): void {
 
 function compactCard(s: Session): string {
   const payload = { v: 1, name: s.nickname || undefined, sid: s.sessionId, pk: s.publicKey,
-    uid: s.githubUserId || undefined, exp: s.expiresAt || undefined };
+    uid: s.githubUserId || undefined, exp: s.expiresAt || undefined, ibk: s.installationBoxKey || undefined };
   return `am1:${Buffer.from(JSON.stringify(payload)).toString("base64url")}`;
 }
 function note(msg: string): void {
@@ -179,6 +179,7 @@ function sessionOutput(s: Session, home: string): Record<string, unknown> {
     github_login: s.githubLogin || undefined,
     github_user_id: s.githubUserId || undefined,
     public_key: s.publicKey,
+    installation_box_key: s.installationBoxKey,
     service: s.serverUrl,
     server: s.serverUrl,
     address_card: s.addressCard,
@@ -190,6 +191,7 @@ function noteAddressCard(s: Session): void {
   note("Address card (share only over a trusted channel):");
   note(`  session_id: ${s.sessionId}`);
   note(`  public_key: ${s.publicKey}`);
+  if (s.installationBoxKey) note(`  installation_box_key: ${s.installationBoxKey}`);
   if (s.githubUserId) note(`  github_user_id: ${s.githubUserId}`);
   if (s.expiresAt) note(`  expires_at: ${s.expiresAt}`);
 }
@@ -219,7 +221,10 @@ export async function run(argv: string[]): Promise<number> {
       }
       case "card": {
         const s = loadSessionOrExit(store, home);
-        emit({ card: compactCard(s), nickname: s.nickname || undefined, session_id: s.sessionId, public_key: s.publicKey });
+        emit({
+          card: compactCard(s), nickname: s.nickname || undefined, session_id: s.sessionId,
+          public_key: s.publicKey, installation_box_key: s.installationBoxKey,
+        });
         return 0;
       }
       case "contact":
@@ -324,6 +329,11 @@ async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionSto
       return 0;
     }
     const installation = new InstallationStore(home).loadOrCreate();
+    // Derived locally from the installation seed — always available with no
+    // server round trip, and deterministic, so it never drifts between the
+    // value we report at registration and the value we use for context
+    // sealing/opening elsewhere in the CLI.
+    const installationBoxKey = installationBoxKeys(installation.seed).publicKey;
     const client = new Client(srv);
     const ctl = new AbortController();
     const cancel = () => ctl.abort();
@@ -362,6 +372,7 @@ async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionSto
           privateKey: kp.privateKey,
           identityType: "github",
           verified: true,
+          installationBoxKey,
         };
         store.save(session);
         emit(sessionOutput(session, home));
@@ -375,6 +386,7 @@ async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionSto
         serverOrigin: new URL(srv).origin,
         signal: ctl.signal,
         note,
+        installationBoxKey,
       });
       const kp = await generateKeypair();
       const session: Session = {
@@ -392,6 +404,7 @@ async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionSto
         installationId: result.installation_id,
         expiresAt: "expires_at" in result ? result.expires_at : undefined,
         addressCard: result.address_card,
+        installationBoxKey,
       };
       store.save(session);
       emit(sessionOutput(session, home));
@@ -415,24 +428,33 @@ function cmdContact(args: ReturnType<typeof parseArgs>, contacts: Contacts): num
     if (compact) {
       if (!compact.startsWith("am1:")) { note("error: invalid address card prefix"); return 2; }
       try {
-        const p = JSON.parse(Buffer.from(compact.slice(4), "base64url").toString("utf8")) as { sid?: string; pk?: string; uid?: string };
+        const p = JSON.parse(Buffer.from(compact.slice(4), "base64url").toString("utf8")) as
+          { sid?: string; pk?: string; uid?: string; ibk?: string };
         if (!p.sid || !p.pk) throw new Error("missing sid or public key");
         const name = args._[1];
         if (!name) { note("usage: agentmsg contact add NAME --card CARD [--force]"); return 2; }
-        contacts.add(name, { sessionId: p.sid, publicKey: p.pk, githubUserId: p.uid || "" }, args.flags.force === true);
+        contacts.add(
+          name,
+          { sessionId: p.sid, publicKey: p.pk, githubUserId: p.uid || "", installationBoxKey: p.ibk || "" },
+          args.flags.force === true,
+        );
         emit({ status: "contact_saved", name, fingerprint: fingerprint(p.pk) });
         return 0;
       } catch { note("error: invalid address card"); return 2; }
     }
     const name = args._[1];
     if (!name || !args.flags.sid || !args.flags.pubkey) {
-      note("usage: agentmsg contact add NAME --sid SID --pubkey PK [--user ID] [--force]");
+      note("usage: agentmsg contact add NAME --sid SID --pubkey PK [--user ID] [--installation-box-key KEY] [--force]");
       return 2;
     }
     const pubkey = String(args.flags.pubkey);
     contacts.add(
       name,
-      { sessionId: String(args.flags.sid), publicKey: pubkey, githubUserId: String(args.flags.user || "") },
+      {
+        sessionId: String(args.flags.sid), publicKey: pubkey,
+        githubUserId: String(args.flags.user || ""),
+        installationBoxKey: String(args.flags["installation-box-key"] || ""),
+      },
       args.flags.force === true,
     );
     // Show the fingerprint so the human can verify it out-of-band (SEC-05).
@@ -795,8 +817,13 @@ async function answerPendingContextKeys(
       const key = keys.get(p.context_id);
       if (!key) continue; // we can't answer for a context we hold no key for
       const contact = book.find((c) => c.githubUserId && c.githubUserId === p.github_user_id);
-      if (!contact?.publicKey) continue; // don't know how to seal to them
-      const sealedKey = await seal(key, contact.publicKey);
+      // Seal to their INSTALLATION box key, not contact.publicKey (their
+      // session's ephemeral messaging keypair) — sealing to the wrong key
+      // produces an envelope their resolveContextKey() can never open. A
+      // contact saved before this field existed has none yet; skip them
+      // rather than send an unopenable envelope (see R4b).
+      if (!contact?.installationBoxKey) continue;
+      const sealedKey = await seal(key, contact.installationBoxKey);
       const list = byContext.get(p.context_id) ?? [];
       list.push({ recipient_installation: p.recipient_installation, sealed_key: sealedKey });
       byContext.set(p.context_id, list);
@@ -956,6 +983,18 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
       note(`   agentmsg contact add ${to} --sid <sid> --pubkey <pubkey> --user <id>`);
       return 1;
     }
+    // Context keys must be sealed to the recipient's INSTALLATION box key,
+    // not addr.publicKey (their session's ephemeral messaging keypair) — the
+    // two are independent X25519 pairs, and only the installation key is
+    // opened by resolveContextKey() on their end (see R4b). A contact saved
+    // before this field existed has none: degrade with a clear message
+    // rather than send an envelope they can never open.
+    if (!addr.installationBoxKey) {
+      note(`error: this contact's card predates installation keys; ask them to re-share.`);
+      note(`   They should re-run 'agentmsg whoami' or 'agentmsg card' and re-send you their card,`);
+      note(`   then: agentmsg contact add ${to} --sid <sid> --pubkey <pubkey> --user <id> --installation-box-key <key> --force`);
+      return 1;
+    }
     // KNOWN LIMITATION: envelopes are supposed to be keyed by the recipient's
     // INSTALLATION id (stable across their sessions), not a session id — see
     // rework-plan.md Task R2. Contacts only records a session id today
@@ -966,7 +1005,7 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
     // needs contacts.ts (and the compact-card format) to carry the peer's
     // installation id too, which is out of R4's scope — flagged for a
     // follow-up rather than silently left inconsistent.
-    await client.addContextMember(id, addr.githubUserId, role, addr.sessionId, await seal(key, addr.publicKey));
+    await client.addContextMember(id, addr.githubUserId, role, addr.sessionId, await seal(key, addr.installationBoxKey));
     emit({ status: "shared", context_id: id, with: to, role });
     return 0;
   }

@@ -63,6 +63,13 @@ export interface AddressCardDTO {
   signature: string;
   github_user_id?: string;
   github_login?: string;
+  // installation_box_key is this installation's X25519 public key (derived
+  // from the installation seed via HKDF — see installation-box.ts), the key
+  // shared-context envelopes must be sealed to. NOT public_key, which is
+  // either the installation's Ed25519 admission-signing key or (legacy
+  // /v1/register) unset. Absent on cards from installations that predate
+  // this field.
+  installation_box_key?: string;
 }
 
 export interface GuestRegistrationResponse {

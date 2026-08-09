@@ -15,15 +15,19 @@ describe("Contacts", () => {
 
   it("adds and resolves a contact by name", () => {
     const c = new Contacts(home);
-    c.add("carol", { sessionId: "sid_c", publicKey: "PK_c", githubUserId: "55" });
-    expect(c.resolve("carol")).toEqual({ sessionId: "sid_c", publicKey: "PK_c", githubUserId: "55" });
+    c.add("carol", { sessionId: "sid_c", publicKey: "PK_c", githubUserId: "55", installationBoxKey: "IBK_c" });
+    expect(c.resolve("carol")).toEqual({
+      sessionId: "sid_c", publicKey: "PK_c", githubUserId: "55", installationBoxKey: "IBK_c",
+    });
   });
 
   it("resolves a raw session id even if not a saved contact (no pubkey)", () => {
     const c = new Contacts(home);
     // A 32-hex-ish session id passed directly still resolves to an address
     // with no known public key, so send falls back to plaintext.
-    expect(c.resolve("deadbeef")).toEqual({ sessionId: "deadbeef", publicKey: "", githubUserId: "" });
+    expect(c.resolve("deadbeef")).toEqual({
+      sessionId: "deadbeef", publicKey: "", githubUserId: "", installationBoxKey: "",
+    });
   });
 
   it("prefers a saved contact over treating the arg as a raw sid", () => {
