@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, statSync, mkdirSync, writeFileSync, chmodSync } fr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ContextKeys } from "../src/context.js";
+import { decryptSym } from "../src/crypto.js";
 
 let home: string;
 beforeEach(() => (home = mkdtempSync(join(tmpdir(), "amsg-ctx-"))));
@@ -14,11 +15,11 @@ import { run } from "../src/cli.js";
 
 let server: Server, base: string;
 let ctxVersion = 0;
-let stored = "";
+let lastNameEnc = "";
 
 beforeEach(async () => {
   ctxVersion = 0;
-  stored = "";
+  lastNameEnc = "";
   server = createServer((req, res) => {
     let b = "";
     req.on("data", (c) => (b += c));
@@ -36,6 +37,7 @@ beforeEach(async () => {
         return res.end(JSON.stringify({ session_id: "s1", token: "t1", github_login: "u", github_user_id: "1" }));
       }
       if (req.url === "/v1/contexts" && req.method === "POST") {
+        lastNameEnc = String(body.name_enc ?? "");
         return res.end(JSON.stringify({ id: "c1", name_enc: body.name_enc, owner_uid: "1", epoch: 1, version: 0, bytes: 0, updated_at: "", role: "owner" }));
       }
       if (req.url === "/v1/contexts/c1" && req.method === "PUT") {
@@ -78,8 +80,17 @@ describe("agentmsg context", () => {
     spy.mockRestore();
 
     expect(code).toBe(0);
-    expect(new ContextKeys(home).get("c1")).toBeTruthy(); // key stored for later reads
-    expect(out.join("")).not.toContain("team notes"); // the name goes out encrypted
+    const savedKey = new ContextKeys(home).get("c1");
+    expect(savedKey).toBeTruthy(); // key stored for later reads
+    expect(out.join("")).not.toContain("team notes"); // the CLI doesn't print it
+
+    // The actual product promise: the server must never receive the plaintext
+    // name. Proving stdout is clean isn't enough — prove what left the machine
+    // was neither the plaintext nor some other garbage, but genuinely the
+    // ciphertext of "team notes" under the key that got saved locally.
+    expect(lastNameEnc).not.toBe("team notes");
+    expect(lastNameEnc).not.toContain("team notes");
+    expect(await decryptSym(lastNameEnc, savedKey!)).toBe("team notes");
   });
 
   // Conflicts are the normal path, so the CLI must surface everything the
