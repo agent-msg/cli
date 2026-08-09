@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import { createServer, Server, IncomingMessage, ServerResponse } from "node:http";
-import { Client, ApiError } from "../src/client.js";
+import { Client, ApiError, VersionConflict } from "../src/client.js";
 
 // A tiny stub server that records requests and replies from a scripted table.
 interface Recorded {
@@ -113,6 +113,28 @@ describe("Client", () => {
     } finally {
       globalThis.fetch = original;
     }
+  });
+
+  it("commitContext raises a typed VersionConflict carrying the server's current_version", async () => {
+    reply = { status: 409, body: { error: "version_conflict", current_version: 7 } };
+    const c = new Client(base, "tok");
+    const err = await c.commitContext("ctx1", 3, 100, "deadbeef").catch((e) => e);
+    expect(err).toBeInstanceOf(VersionConflict);
+    expect((err as VersionConflict).currentVersion).toBe(7);
+  });
+
+  it("commitContext does NOT fabricate VersionConflict(0) when current_version is missing from the 409 body", async () => {
+    // A well-behaved server always sends current_version, so this simulates a
+    // malformed/unexpected 409 envelope. The old behavior (Number(undefined ?? 0))
+    // would silently produce VersionConflict(0), letting a caller merge onto a
+    // version that doesn't exist and destroy the other writer's work with no
+    // visible error. The fix must instead surface a failure.
+    reply = { status: 409, body: { error: "version_conflict" } };
+    const c = new Client(base, "tok");
+    const err = await c.commitContext("ctx1", 3, 100, "deadbeef").catch((e) => e);
+    expect(err).not.toBeInstanceOf(VersionConflict);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).status).toBe(409);
   });
 });
 

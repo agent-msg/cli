@@ -552,6 +552,13 @@ export class Client {
    *  JSON. A regex over error.message (as the brief drafted) would always match
    *  nothing and silently default to version 0. Reading `details.current_version`
    *  is the only reliable path given what call() actually produces.
+   *
+   *  If the server's 409 body is missing `current_version` (or sends a
+   *  non-number), we do NOT manufacture VersionConflict(0) — a fabricated
+   *  version is worse than an exception, because a caller would silently merge
+   *  onto the wrong base and destroy the other writer's data with no error
+   *  anywhere. Instead the original ApiError is rethrown so the failure is
+   *  visible.
    */
   async commitContext(id: string, expectedVersion: number, bytes: number, sha256: string): Promise<ContextDTO> {
     try {
@@ -560,8 +567,9 @@ export class Client {
       });
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
-        const cv = e.details?.current_version;
-        throw new VersionConflict(typeof cv === "number" ? cv : Number(cv ?? 0));
+        const cv = e.details.current_version;
+        if (typeof cv !== "number" || !Number.isFinite(cv)) throw e;
+        throw new VersionConflict(cv);
       }
       throw e;
     }
