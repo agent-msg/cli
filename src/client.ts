@@ -187,6 +187,25 @@ export interface PutContextResponse {
   blob_key: string;
 }
 
+/** One outstanding authorisation: a member whose installation has no
+ *  sealed-key envelope for the context's current epoch. Only returned by
+ *  GET /v1/contexts/pending to a caller who already holds a key themselves —
+ *  see api_context.go's handleListPendingContextKeys for why. */
+export interface PendingKeyDTO {
+  context_id: string;
+  epoch: number;
+  github_user_id: string;
+  role: string;
+  recipient_installation: string;
+}
+
+/** One sealed-key envelope, addressed to the recipient's installation id
+ *  (never a session id — see the R2/R3 rework). */
+export interface KeyEnvelope {
+  recipient_installation: string;
+  sealed_key: string;
+}
+
 /** Thrown on 409 so callers can merge rather than parse an error string. */
 export class VersionConflict extends Error {
   constructor(public currentVersion: number) {
@@ -575,13 +594,32 @@ export class Client {
     }
   }
 
-  addContextMember(id: string, githubUserID: string, role: string, recipientSession: string, sealedKey: string): Promise<unknown> {
+  // recipientInstallation is the recipient's INSTALLATION id, not a session id
+  // — envelopes bind to installation (see rework-plan.md Task R2). An older
+  // brief called this field recipient_session; that name is stale and the
+  // server no longer recognizes it.
+  addContextMember(id: string, githubUserID: string, role: string, recipientInstallation: string, sealedKey: string): Promise<unknown> {
     return this.call("POST", `/v1/contexts/${encodeURIComponent(id)}/members`, {
-      github_user_id: githubUserID, role, recipient_session: recipientSession, sealed_key: sealedKey,
+      github_user_id: githubUserID, role, recipient_installation: recipientInstallation, sealed_key: sealedKey,
     });
   }
 
   removeContextMember(id: string, githubUserID: string): Promise<ContextDTO> {
     return this.call("DELETE", `/v1/contexts/${encodeURIComponent(id)}/members/${encodeURIComponent(githubUserID)}`);
+  }
+
+  /** Authorisations the caller could answer, across every context they belong
+   *  to. Empty for a caller who holds no key anywhere — see PendingKeyDTO. */
+  pendingContextKeys(): Promise<PendingKeyDTO[]> {
+    return this.call("GET", "/v1/contexts/pending");
+  }
+
+  /** Upload one or more sealed-key envelopes for a context's CURRENT epoch.
+   *  Used both by the owner re-keying after a revoke and by any other
+   *  keyholder answering a pending authorisation (piggyback answering). The
+   *  server refuses to overwrite a slot that already has an envelope, so
+   *  callers must only target empty slots (see rework-plan.md Task R4). */
+  uploadContextKeys(id: string, envelopes: KeyEnvelope[]): Promise<unknown> {
+    return this.call("POST", `/v1/contexts/${encodeURIComponent(id)}/keys`, { envelopes });
   }
 }

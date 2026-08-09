@@ -3,7 +3,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { InstallationStore, installationBoxKeys, installationKeyFromSeed } from "../src/installation.js";
+import { InstallationStore, installationKeyFromSeed } from "../src/installation.js";
+import { installationBoxKeys } from "../src/installation-box.js";
 import { open, seal } from "../src/crypto.js";
 
 let home: string;

@@ -3,7 +3,7 @@
 // known (a saved contact), the message body is sealed on THIS machine before it
 // reaches the client, so the server only ever sees ciphertext.
 import { generateKeypair, seal, open, sealBytes, openBytes, generateContextKey, encryptSym, decryptSym } from "./crypto.js";
-import { Client, ApiError, VersionConflict } from "./client.js";
+import { Client, ApiError, VersionConflict, ContextDTO, KeyEnvelope } from "./client.js";
 import {
   SessionStore,
   Session,
@@ -19,6 +19,7 @@ import { Contacts, fingerprint } from "./contacts.js";
 import { deviceFlowToken, DEFAULT_CLIENT_ID } from "./github.js";
 import { normalizeServerUrl } from "./serverurl.js";
 import { InstallationStore } from "./installation.js";
+import { installationBoxKeys, InstallationBoxKeys } from "./installation-box.js";
 import { CLI_VERSION, registerGuestFirst } from "./guest.js";
 import { ContextKeys } from "./context.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync } from "node:fs";
@@ -710,6 +711,67 @@ function cliVersion(): string {
   return cachedVersion;
 }
 
+// Resolve a context's local decryption key, importing it from the server's
+// `sealed_key` envelope when we don't have one yet. This is the receive side
+// of member-to-member key distribution: a key gets sealed and uploaded by
+// whoever answers (see answerPendingContextKeys below), but until something
+// opens it and saves it locally, sharing never actually completes.
+async function resolveContextKey(
+  client: Client,
+  keys: ContextKeys,
+  boxKeys: InstallationBoxKeys,
+  id: string,
+  dto?: ContextDTO,
+): Promise<string | undefined> {
+  const local = keys.get(id);
+  if (local) return local;
+  const c = dto ?? (await client.getContext(id).catch(() => undefined));
+  if (!c?.sealed_key) return undefined;
+  try {
+    const key = await open(c.sealed_key, boxKeys.publicKey, boxKeys.privateKey);
+    keys.save(id, key);
+    return key;
+  } catch {
+    return undefined; // not addressed to us, or tampered — treat as absent
+  }
+}
+
+// Piggyback answering: rides on any context command the agent already runs.
+// For each outstanding pending authorisation we hold the key for and know a
+// public key for (a saved contact), seal it and upload. Quiet on success,
+// and a failure here must never break the command the user actually asked
+// for — hence the outer try/catch swallowing everything.
+async function answerPendingContextKeys(
+  client: Client,
+  keys: ContextKeys,
+  contacts: Contacts,
+  selfInstallationId?: string,
+): Promise<void> {
+  try {
+    const pending = await client.pendingContextKeys();
+    if (!Array.isArray(pending) || pending.length === 0) return;
+    const byContext = new Map<string, KeyEnvelope[]>();
+    const book = contacts.list();
+    for (const p of pending) {
+      if (!p?.context_id || !p.recipient_installation) continue;
+      if (selfInstallationId && p.recipient_installation === selfInstallationId) continue;
+      const key = keys.get(p.context_id);
+      if (!key) continue; // we can't answer for a context we hold no key for
+      const contact = book.find((c) => c.githubUserId && c.githubUserId === p.github_user_id);
+      if (!contact?.publicKey) continue; // don't know how to seal to them
+      const sealedKey = await seal(key, contact.publicKey);
+      const list = byContext.get(p.context_id) ?? [];
+      list.push({ recipient_installation: p.recipient_installation, sealed_key: sealedKey });
+      byContext.set(p.context_id, list);
+    }
+    for (const [contextId, envelopes] of byContext) {
+      await client.uploadContextKeys(contextId, envelopes).catch(() => {});
+    }
+  } catch {
+    // Never let a failed answer break the command the user actually asked for.
+  }
+}
+
 // Shared contexts. The document and its name are encrypted with a symmetric
 // key held locally; the server stores ciphertext and a version number.
 async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStore, home: string): Promise<number> {
@@ -717,6 +779,21 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
   const s = loadSessionOrExit(store, home);
   const client = new Client(s.serverUrl, s.token);
   const keys = new ContextKeys(home);
+  const contacts = new Contacts(home);
+  const installation = new InstallationStore(home).loadOrCreate();
+  const boxKeys = installationBoxKeys(installation.seed);
+  // The verified/dev-user registration response (POST /v1/register) does not
+  // carry installation_id, unlike the guest flow — so a session created that
+  // way has no s.installationId cached locally. Fall back to asking the
+  // server for our own current address card, which always has it. This is
+  // needed both to skip ourselves in the pending list below and to
+  // self-address the envelope during a real key rotation on revoke.
+  const selfInstallationId =
+    s.installationId || (await client.addressCard().then((c) => c.installation_id).catch(() => undefined));
+
+  // Any context command answers what pending authorisations it can, in
+  // passing — no daemon, no separate command.
+  await answerPendingContextKeys(client, keys, contacts, selfInstallationId);
 
   if (sub === "create") {
     const name = args.flags.name !== undefined ? String(args.flags.name) : "";
@@ -755,7 +832,7 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
       return 2;
     }
     const c = await client.getContext(id);
-    const key = keys.get(id);
+    const key = await resolveContextKey(client, keys, boxKeys, id, c);
     if (!key) {
       note(`error: no local key for context ${id} — ask the owner to share it again.`);
       return 1;
@@ -776,7 +853,7 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
       note("usage: agentmsg context set --id ID --text TEXT [--expect VERSION]");
       return 2;
     }
-    const key = keys.get(id);
+    const key = await resolveContextKey(client, keys, boxKeys, id);
     if (!key) {
       note(`error: no local key for context ${id} — ask the owner to share it again.`);
       return 1;
@@ -815,18 +892,27 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
       note("usage: agentmsg context share --id ID --to NAME|SID [--role writer|reader]");
       return 2;
     }
-    const key = keys.get(id);
+    const key = await resolveContextKey(client, keys, boxKeys, id);
     if (!key) {
       note(`error: no local key for context ${id}.`);
       return 1;
     }
-    const contacts = new Contacts(home);
     const addr = contacts.resolve(to);
     if (!addr?.publicKey || !addr.githubUserId) {
       note(`error: need a saved contact with a public key and numeric id for "${to}".`);
       note(`   agentmsg contact add ${to} --sid <sid> --pubkey <pubkey> --user <id>`);
       return 1;
     }
+    // KNOWN LIMITATION: envelopes are supposed to be keyed by the recipient's
+    // INSTALLATION id (stable across their sessions), not a session id — see
+    // rework-plan.md Task R2. Contacts only records a session id today
+    // (contact add --sid), so this still addresses the envelope by session
+    // id. It works when that is also the id the recipient's server-side
+    // membership row was created with, but does not yet deliver the
+    // cross-session guarantee the rest of this rework provides. Fixing it
+    // needs contacts.ts (and the compact-card format) to carry the peer's
+    // installation id too, which is out of R4's scope — flagged for a
+    // follow-up rather than silently left inconsistent.
     await client.addContextMember(id, addr.githubUserId, role, addr.sessionId, await seal(key, addr.publicKey));
     emit({ status: "shared", context_id: id, with: to, role });
     return 0;
@@ -839,10 +925,55 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
       note("usage: agentmsg context revoke --id ID --user GITHUB_USER_ID");
       return 2;
     }
+    const oldKey = keys.get(id);
     const c = await client.removeContextMember(id, uid);
-    note(">> access revoked and key epoch advanced.");
-    note(">> NOTE: this protects future writes only. Anything they already read is on their machine.");
-    emit({ context_id: id, epoch: c.epoch });
+
+    // Honest revoke: bumping the epoch alone has zero cryptographic effect —
+    // the removed member's old key still opens anything written afterward
+    // unless the content is actually re-encrypted under a fresh key they
+    // never receive. We can only do that if we hold the OLD key locally
+    // (needed to decrypt existing content before re-encrypting it); if we
+    // don't, we fall through having advanced the epoch but rotated nothing,
+    // and print no claim of protection — a false security promise is worse
+    // than a missing feature.
+    let rotated = false;
+    if (oldKey) {
+      try {
+        const freshKey = await generateContextKey();
+        const full = await client.getContext(id);
+        if (full.download_url) {
+          const ct = await client.download(new URL(full.download_url).pathname);
+          const plaintext = await decryptSym(Buffer.from(ct).toString("utf8"), oldKey);
+          const newCt = Buffer.from(await encryptSym(plaintext, freshKey), "utf8");
+          const sha256 = createHash("sha256").update(newCt).digest("hex");
+          const ticket = await client.putContext(id, full.version, newCt.length, sha256);
+          await client.uploadPut(ticket.upload_url, newCt, "application/octet-stream");
+          await client.commitContext(id, full.version, newCt.length, sha256);
+        }
+        // Deliver the fresh key to OURSELVES first: the server trusts the
+        // owner unconditionally for this (see handleRotateKeys), and doing
+        // so is what lets GET /v1/contexts/pending see us as a keyholder for
+        // the new epoch — which is how we then discover the remaining
+        // members to answer, via the exact piggyback path used elsewhere.
+        if (selfInstallationId) {
+          const selfSealed = await seal(freshKey, boxKeys.publicKey);
+          await client.uploadContextKeys(id, [{ recipient_installation: selfInstallationId, sealed_key: selfSealed }]);
+        }
+        keys.save(id, freshKey);
+        await answerPendingContextKeys(client, keys, contacts, selfInstallationId);
+        rotated = true;
+      } catch (e) {
+        note(`warning: key rotation after revoke did not complete (${(e as Error).message}). Epoch was still advanced.`);
+      }
+    }
+
+    if (rotated) {
+      note(">> access revoked and the context key was rotated: the removed member's key no longer decrypts new writes.");
+    } else {
+      note(">> access revoked and key epoch advanced.");
+    }
+    note(">> NOTE: this does not undo anything the removed member already read — that copy is on their machine.");
+    emit({ context_id: id, epoch: c.epoch, rotated });
     return 0;
   }
 
