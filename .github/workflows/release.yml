@@ -1,0 +1,91 @@
+# Publish to npm automatically once a version bump lands on main and the full
+# CI matrix is green.
+#
+# The release trigger is the `version` field in package.json, not a tag: bumping
+# it in a PR means the version that ships is reviewed like any other change, and
+# there is no second manual step that can be forgotten or done against the wrong
+# commit. A push to main that does not change the version does nothing here.
+#
+# The tag is created *after* a successful publish, so a tag always means "this
+# exact commit is on npm" rather than "someone intended to release this".
+# Tags pushed with GITHUB_TOKEN do not trigger workflows, so this cannot loop
+# back into publish.yml.
+#
+# publish.yml still exists as the manual escape hatch (tag push or
+# workflow_dispatch) for re-running a release that failed after CI.
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  # Decide whether there is anything to release before spending 6 matrix jobs on
+  # it. npm is the source of truth for "already released", not the git history —
+  # it is the thing we would collide with.
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      should-release: ${{ steps.check.outputs.should-release }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - id: check
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if npm view "agentmsg@$VERSION" version >/dev/null 2>&1; then
+            echo "should-release=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::agentmsg@$VERSION is already on npm; nothing to release"
+          else
+            echo "should-release=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::agentmsg@$VERSION is not on npm; releasing"
+          fi
+
+  # The gate. Same file the PR ran, so nothing ships that main's own CI would
+  # have rejected — including the Node 18 and Windows cases that only CI covers.
+  test:
+    needs: guard
+    if: needs.guard.outputs.should-release == 'true'
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: [guard, test]
+    if: needs.guard.outputs.should-release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release tag
+      id-token: write # npm provenance attestation
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
+      # --ignore-scripts skips prepublishOnly; the matrix above already built and
+      # tested this exact tree on six platform/runtime combinations.
+      - name: Publish
+        run: npm publish --access public --provenance --ignore-scripts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Tag the published commit
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          git tag "v$VERSION"
+          git push origin "v$VERSION"

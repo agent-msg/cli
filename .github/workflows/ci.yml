@@ -4,6 +4,9 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Lets release.yml reuse this exact matrix as its release gate, so "CI is
+  # green" and "safe to publish" can never drift into two different definitions.
+  workflow_call:
 
 permissions:
   contents: read
