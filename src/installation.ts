@@ -249,13 +249,44 @@ function keychainSet(home: string, seed: Buffer): boolean {
   return result.status === 0;
 }
 
+/** Reads an existing installation identity from `home` without creating one.
+ *  Returns null (never throws) if none is present or it cannot be read — the
+ *  caller decides whether that is expected (a plain legacy-migration probe)
+ *  or an error. Mirrors the read half of InstallationStore#loadOrCreate. */
+function tryReadInstallation(home: string): { seed: Buffer; meta: InstallationMeta } | null {
+  const metaFile = join(home, "installation.json");
+  const keyFile = join(home, "installation.key");
+  if (!existsSync(metaFile) || lstatSync(metaFile).isSymbolicLink()) return null;
+  let meta: InstallationMeta;
+  try {
+    meta = JSON.parse(readFileSync(metaFile, "utf8")) as InstallationMeta;
+  } catch {
+    return null;
+  }
+  let seed = meta.storage === "keychain" ? keychainGet(home) : null;
+  if (!seed && existsSync(keyFile)) {
+    try {
+      seed = readSecureSeed(keyFile);
+    } catch {
+      return null;
+    }
+  }
+  return seed ? { seed, meta } : null;
+}
+
 export class InstallationStore {
   private readonly keyFile: string;
   private readonly metaFile: string;
+  // A profile-scoped home that may hold an installation identity minted
+  // before installation/context state moved to the base home (R7). Checked
+  // only when nothing already exists at `home`, and only to migrate — never
+  // to override an identity that already lives at `home`.
+  private readonly legacyHome?: string;
 
-  constructor(private readonly home: string) {
+  constructor(private readonly home: string, opts?: { legacyHome?: string }) {
     this.keyFile = join(home, "installation.key");
     this.metaFile = join(home, "installation.json");
+    this.legacyHome = opts?.legacyHome;
   }
 
   loadOrCreate(): InstallationKey {
@@ -268,6 +299,22 @@ export class InstallationStore {
     let seed = meta?.storage === "keychain" ? keychainGet(this.home) : null;
     if (!seed && existsSync(this.keyFile)) seed = readSecureSeed(this.keyFile);
     if (meta && !seed) throw new Error("installation private key is unavailable; refusing to create a new identity");
+
+    // Nothing at `home` yet: before minting a brand-new identity, check
+    // whether a pre-R7 profile-scoped home already has one. Minting fresh
+    // here would silently orphan every shared-context key the user holds,
+    // sealed to that old identity.
+    if (!seed && this.legacyHome && this.legacyHome !== this.home) {
+      const legacy = tryReadInstallation(this.legacyHome);
+      if (legacy) {
+        seed = legacy.seed;
+        const storage = keychainSet(this.home, seed) ? "keychain" : "file";
+        if (storage === "file") atomicWritePrivate(this.keyFile, b64url(seed) + "\n");
+        meta = { version: 1, algorithm: "ed25519", public_key: legacy.meta.public_key, storage };
+        atomicWritePrivate(this.metaFile, JSON.stringify(meta, null, 2) + "\n");
+        return installationKeyFromSeed(seed);
+      }
+    }
 
     if (!seed) {
       const generated = generateInstallationKey();

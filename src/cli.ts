@@ -328,7 +328,12 @@ async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionSto
       noteAddressCard(current);
       return 0;
     }
-    const installation = new InstallationStore(home).loadOrCreate();
+    // Installation identity belongs to the MACHINE, not the session: it lives
+    // in the base home so every agent session here shares one identity (and
+    // therefore can decrypt the same shared-context keys). `home` is passed
+    // as legacyHome so a pre-R7 identity already sitting in this session's
+    // isolated profile dir gets promoted instead of orphaned.
+    const installation = new InstallationStore(baseHome(), { legacyHome: home }).loadOrCreate();
     // Derived locally from the installation seed — always available with no
     // server round trip, and deterministic, so it never drifts between the
     // value we report at registration and the value we use for context
@@ -842,9 +847,13 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
   const sub = args._[0];
   const s = loadSessionOrExit(store, home);
   const client = new Client(s.serverUrl, s.token);
-  const keys = new ContextKeys(home);
+  // contexts.json and the installation identity both belong to the machine,
+  // not this session — they live in the base home (see cmdRegister for why),
+  // with `home` (this session's isolated profile dir) as the legacy-migration
+  // source for a pre-R7 identity.
+  const keys = new ContextKeys(baseHome());
   const contacts = new Contacts(home);
-  const installation = new InstallationStore(home).loadOrCreate();
+  const installation = new InstallationStore(baseHome(), { legacyHome: home }).loadOrCreate();
   const boxKeys = installationBoxKeys(installation.seed);
   // The verified/dev-user registration response (POST /v1/register) does not
   // carry installation_id, unlike the guest flow — so a session created that
