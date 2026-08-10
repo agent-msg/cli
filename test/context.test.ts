@@ -22,8 +22,24 @@ let ctxEpoch = 1;
 let lastNameEnc = "";
 // Test-controlled fixtures for the new pending/keys/get-content endpoints.
 let ctxSealedKey = ""; // sealed_key returned by GET /v1/contexts/c1
-let ctxDownloadContent = ""; // ciphertext served at /download-content
+let ctxDownloadContent = ""; // ciphertext served at /download-content, i.e. what's actually COMMITTED
 let ctxHasContent = false;
+// Bytes handed to PUT /upload are staged here, not published to
+// ctxDownloadContent, until /commit actually succeeds — mirroring the real
+// server (handleCommitContext is what moves BlobKey onto the context; a raw
+// upload to a presigned URL is invisible via GET .../c1's download_url until
+// commit finalizes it, see api_context.go handlePutContext/handleCommitContext).
+// This matters for the R15 failure-injection tests below: if this fake
+// published on upload instead of on commit, a commit-step failure would leave
+// the fake "server" already serving the NEW ciphertext even though the real
+// server never would, producing a false unrecoverable result.
+let pendingUploadContent = "";
+// Failure-injection toggles for the R15 revoke-mid-flight tests: each makes
+// the named endpoint fail exactly like a real network/server error would,
+// so the CLI's own error path runs for real rather than being simulated.
+let failDownloadContent = false;
+let failUpload = false;
+let failCommit = false;
 let pendingList: unknown[] = [];
 // Fixture for GET /v1/contexts/c1/members — the server's own, always-current
 // record of each member's installation id + PUBLIC box key. Tests set this
@@ -53,6 +69,10 @@ beforeEach(async () => {
   ctxSealedKey = "";
   ctxDownloadContent = "";
   ctxHasContent = false;
+  pendingUploadContent = "";
+  failDownloadContent = false;
+  failUpload = false;
+  failCommit = false;
   pendingList = [];
   membersList = [];
   uploadedEnvelopes = [];
@@ -153,22 +173,38 @@ beforeEach(async () => {
         }));
       }
       if (req.url === "/download-content" && req.method === "GET") {
+        if (failDownloadContent) {
+          res.statusCode = 500;
+          return res.end(JSON.stringify({ error: "injected_failure", message: "download-content injected failure" }));
+        }
         return res.end(ctxDownloadContent);
       }
       if (req.url === "/v1/contexts/c1" && req.method === "PUT") {
         return res.end(JSON.stringify({ upload_url: base + "/upload", blob_key: "k" }));
       }
       if (req.url === "/upload") {
-        ctxDownloadContent = b;
-        ctxHasContent = true;
+        if (failUpload) {
+          res.statusCode = 500;
+          return res.end(JSON.stringify({ error: "injected_failure", message: "upload injected failure" }));
+        }
+        // Staged, not published — see pendingUploadContent's doc comment
+        // above. Real committing (BlobKey pointing at this) only happens in
+        // the /commit handler below, on success.
+        pendingUploadContent = b;
         return res.end("{}");
       }
       if (req.url === "/v1/contexts/c1/commit") {
+        if (failCommit) {
+          res.statusCode = 500;
+          return res.end(JSON.stringify({ error: "injected_failure", message: "commit injected failure" }));
+        }
         if (body.expected_version !== ctxVersion) {
           res.statusCode = 409;
           return res.end(JSON.stringify({ error: "version_conflict", current_version: ctxVersion }));
         }
         ctxVersion++;
+        ctxDownloadContent = pendingUploadContent;
+        ctxHasContent = true;
         return res.end(JSON.stringify({ id: "c1", name_enc: "", owner_uid: "1", epoch: ctxEpoch, version: ctxVersion, bytes: 0, updated_at: "", role: "owner" }));
       }
       res.end("{}");
@@ -650,6 +686,115 @@ describe("agentmsg context", () => {
       const msg = errs.join("");
       expect(msg).toMatch(/older epoch/i);
       expect(msg).toMatch(/recover|import-recovery|context get/i);
+    });
+
+    // R15 — failure injection across the network round trips revoke's key
+    // rotation spans (removeContextMember already bumped the epoch by the
+    // time any of these run; see handleRemoveContextMember in the server).
+    // The invariant under test: until the re-encrypted content is actually
+    // committed, the LOCAL key must remain the OLD one — the one that still
+    // matches what the server has stored — and a plain retry of
+    // `context revoke` must be able to finish the job. Persisting the fresh
+    // key before commit succeeds would leave the owner holding a key that
+    // opens nothing on the server, with the real key discarded: worse than
+    // the bug this rotation exists to fix.
+    describe("mid-flight failure (R15)", () => {
+      async function setUpRevocableContext(): Promise<string> {
+        expect(await cli("register", "--dev-user", "9", "--allow-insecure-http")).toBe(0);
+        await cli("context", "create", "--name", "n");
+        await cli("context", "set", "--id", "c1", "--text", "hello", "--expect", "0");
+        return new ContextKeys(home).get("c1")!;
+      }
+
+      it("survives a failure BEFORE putContext: old key untouched and still matches the server, retry completes", async () => {
+        const oldKey = await setUpRevocableContext();
+
+        failDownloadContent = true; // fails inside the download step, before putContext is ever called
+        const errs1: string[] = [];
+        let espy = vi.spyOn(process.stderr, "write").mockImplementation((c: any) => (errs1.push(String(c)), true));
+        const code1 = await cli("context", "revoke", "--id", "c1", "--user", "99");
+        espy.mockRestore();
+        expect(code1).toBe(0); // revoke's own top-level result is still 0 (member removal happened); rotation itself degraded
+        expect(errs1.join("")).toMatch(/did not fully complete/i);
+
+        // The invariant: local key is still the OLD one, and it still opens
+        // what the "server" actually has stored (nothing was re-encrypted).
+        expect(new ContextKeys(home).get("c1")).toBe(oldKey);
+        expect(await decryptSym(ctxDownloadContent, oldKey)).toBe("hello");
+
+        failDownloadContent = false;
+        const errs2: string[] = [];
+        espy = vi.spyOn(process.stderr, "write").mockImplementation((c: any) => (errs2.push(String(c)), true));
+        const code2 = await cli("context", "revoke", "--id", "c1", "--user", "99");
+        espy.mockRestore();
+        expect(code2).toBe(0);
+        expect(errs2.join("")).toMatch(/no longer decrypts|rotated/i);
+
+        const finalKey = new ContextKeys(home).get("c1")!;
+        expect(finalKey).not.toBe(oldKey);
+        expect(await decryptSym(ctxDownloadContent, finalKey)).toBe("hello");
+        await expect(decryptSym(ctxDownloadContent, oldKey)).rejects.toThrow();
+      });
+
+      it("survives a failure BETWEEN putContext and uploadPut: old key untouched and still matches the server, retry completes", async () => {
+        const oldKey = await setUpRevocableContext();
+
+        failUpload = true;
+        const errs1: string[] = [];
+        let espy = vi.spyOn(process.stderr, "write").mockImplementation((c: any) => (errs1.push(String(c)), true));
+        const code1 = await cli("context", "revoke", "--id", "c1", "--user", "99");
+        espy.mockRestore();
+        expect(code1).toBe(0);
+        expect(errs1.join("")).toMatch(/did not fully complete/i);
+
+        expect(new ContextKeys(home).get("c1")).toBe(oldKey);
+        expect(await decryptSym(ctxDownloadContent, oldKey)).toBe("hello");
+
+        failUpload = false;
+        const errs2: string[] = [];
+        espy = vi.spyOn(process.stderr, "write").mockImplementation((c: any) => (errs2.push(String(c)), true));
+        const code2 = await cli("context", "revoke", "--id", "c1", "--user", "99");
+        espy.mockRestore();
+        expect(code2).toBe(0);
+        expect(errs2.join("")).toMatch(/no longer decrypts|rotated/i);
+
+        const finalKey = new ContextKeys(home).get("c1")!;
+        expect(finalKey).not.toBe(oldKey);
+        expect(await decryptSym(ctxDownloadContent, finalKey)).toBe("hello");
+        await expect(decryptSym(ctxDownloadContent, oldKey)).rejects.toThrow();
+      });
+
+      it("survives a failure BETWEEN uploadPut and commitContext: old key untouched and still matches the server, retry completes", async () => {
+        const oldKey = await setUpRevocableContext();
+
+        failCommit = true;
+        const errs1: string[] = [];
+        let espy = vi.spyOn(process.stderr, "write").mockImplementation((c: any) => (errs1.push(String(c)), true));
+        const code1 = await cli("context", "revoke", "--id", "c1", "--user", "99");
+        espy.mockRestore();
+        expect(code1).toBe(0);
+        expect(errs1.join("")).toMatch(/did not fully complete/i);
+
+        // Crucial: the raw bytes were uploaded (PUT succeeded) but never
+        // committed, so what the server actually serves is still the OLD
+        // ciphertext — exactly what a real server does (BlobKey only moves
+        // on a successful commit; see handleCommitContext).
+        expect(new ContextKeys(home).get("c1")).toBe(oldKey);
+        expect(await decryptSym(ctxDownloadContent, oldKey)).toBe("hello");
+
+        failCommit = false;
+        const errs2: string[] = [];
+        espy = vi.spyOn(process.stderr, "write").mockImplementation((c: any) => (errs2.push(String(c)), true));
+        const code2 = await cli("context", "revoke", "--id", "c1", "--user", "99");
+        espy.mockRestore();
+        expect(code2).toBe(0);
+        expect(errs2.join("")).toMatch(/no longer decrypts|rotated/i);
+
+        const finalKey = new ContextKeys(home).get("c1")!;
+        expect(finalKey).not.toBe(oldKey);
+        expect(await decryptSym(ctxDownloadContent, finalKey)).toBe("hello");
+        await expect(decryptSym(ctxDownloadContent, oldKey)).rejects.toThrow();
+      });
     });
 
     // The propagation gap this task closes: rotation must reach a remaining

@@ -1140,16 +1140,56 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
     // and fail loudly — no removeContextMember call, no epoch bump, no key
     // saved — if we still don't have a current one.
     const resolved = await resolveContextKey(client, keys, boxKeys, id);
-    if (!resolved.key) {
+    let oldKey = resolved.key;
+    let resolvedStale = resolved.stale;
+    if (!oldKey) {
+      // R15 fallback: a "stale" verdict here can mean two different things,
+      // and resolveContextKey's plain epoch-string comparison cannot tell
+      // them apart. (1) genuinely stale — someone else rotated for real and
+      // we never got the new envelope; nothing safe to do. (2) OUR OWN prior
+      // revoke attempt bumped the epoch (removeContextMember does that
+      // unconditionally, before any of the content re-encryption below runs
+      // — see handleRemoveContextMember on the server) but then failed
+      // before committing the re-encrypted content — so the epoch counter
+      // moved even though the actual content key never changed. Case 2 must
+      // still let this command proceed, or a mid-flight failure would
+      // permanently strand the owner: no envelope exists yet for the bumped
+      // epoch (self-delivery happens only after a successful commit, further
+      // below), so the ordinary resolveContextKey path can never recover on
+      // its own.
+      //
+      // Distinguish them the only way that's actually authoritative: try
+      // decrypting what the server currently has stored with our locally
+      // cached (epoch-mismatched) key. Case 2 succeeds, because the content
+      // was never actually re-encrypted (commit is the ONLY step that moves
+      // it — see handleCommitContext on the server). Case 1 fails, because
+      // the content genuinely is under a different key now.
+      const entry = keys.getEntry(id);
+      if (entry?.key) {
+        try {
+          const dto = await client.getContext(id);
+          if (dto.download_url) {
+            const ct = await client.download(new URL(dto.download_url).pathname);
+            await decryptSym(Buffer.from(ct).toString("utf8"), entry.key);
+            oldKey = entry.key;
+            resolvedStale = false;
+          }
+        } catch {
+          // Either no content to verify against, or it didn't decrypt with
+          // our stale key — genuinely stale. Fall through to the refusal
+          // below, unchanged from before this fallback existed.
+        }
+      }
+    }
+    if (!oldKey) {
       note(
-        `error: cannot revoke on context ${id} — your local key is ${resolved.stale ? "from an older epoch" : "missing"}, ` +
+        `error: cannot revoke on context ${id} — your local key is ${resolvedStale ? "from an older epoch" : "missing"}, ` +
           `so there is nothing to safely re-encrypt the existing content with. ` +
           `Recover the current key first — run 'agentmsg context get --id ${id}' to import a fresh envelope, ` +
           `or 'agentmsg context import-recovery' if you have a recovery code — then retry revoke.`,
       );
       return 1;
     }
-    const oldKey = resolved.key;
     const c = await client.removeContextMember(id, uid);
 
     // We now know (from the check above) that we hold the pre-revoke
@@ -1159,28 +1199,44 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
     let rotated = false;
     {
       const freshKey = await generateContextKey();
-      // Commit the fresh key to LOCAL storage before any of the network
-      // calls below that could fail partway through. This is what keeps
-      // local state from ever lagging behind the server: even if content
-      // re-encryption or delivery to other members fails, we already hold
-      // the correct key for the new epoch (c.epoch, from the removal above,
-      // which already bumped it) — so resolveContextKey's epoch check finds
-      // a match on the very next command instead of a stale key nobody can
-      // recover from. Import-on-read (the fix above) is what makes it safe
-      // to commit here first: a mid-rotation crash now degrades to "retry",
-      // not "permanently locked out."
-      keys.save(id, freshKey, c.epoch);
+      const verifiedOldKey = oldKey;
+      // R15: the fresh key must NOT be persisted locally until we know the
+      // rotation actually completed. It used to be saved here, before any of
+      // the network calls below — reasoned (wrongly) as "safe because a
+      // mid-rotation crash degrades to retry, not lockout". It doesn't: this
+      // whole step runs AFTER removeContextMember above, which has already
+      // unconditionally bumped the epoch (see handleRemoveContextMember on
+      // the server) — content re-encryption hasn't happened yet at that
+      // point. If we saved freshKey here and then failed before commit, the
+      // locally stored key would stop matching what the server actually has
+      // stored (still under the OLD key, since commit — the only step that
+      // moves BlobKey, see handleCommitContext — never ran), with no
+      // self-envelope yet uploaded to re-import from either. That is a
+      // self-inflicted, unrecoverable lockout: worse than the bug this
+      // rotation exists to fix. So freshKey is only committed to local
+      // storage once every step that actually changes what's on the server
+      // has succeeded — see the `keys.save` call at the end of this
+      // try-block. Until then, the on-disk key stays the OLD one, which
+      // still opens the content the server still has (the fallback a few
+      // lines up, in the `!oldKey` branch, is what lets a retry find it
+      // again even though the epoch counter has moved on).
       try {
         const full = await client.getContext(id);
         if (full.download_url) {
           const ct = await client.download(new URL(full.download_url).pathname);
-          const plaintext = await decryptSym(Buffer.from(ct).toString("utf8"), oldKey);
+          const plaintext = await decryptSym(Buffer.from(ct).toString("utf8"), verifiedOldKey);
           const newCt = Buffer.from(await encryptSym(plaintext, freshKey), "utf8");
           const sha256 = createHash("sha256").update(newCt).digest("hex");
           const ticket = await client.putContext(id, full.version, newCt.length, sha256);
           await client.uploadPut(ticket.upload_url, newCt, "application/octet-stream");
           await client.commitContext(id, full.version, newCt.length, sha256, ticket.blob_key);
         }
+        // Only now — content (if any) is safely re-encrypted and committed,
+        // or there was none to begin with — is it safe to make freshKey the
+        // key of record locally. Everything from here on (self-delivery,
+        // piggyback answering) is best-effort: its failure doesn't strand
+        // us, because the local key and the server's content already agree.
+        keys.save(id, freshKey, c.epoch);
         // Deliver the fresh key to OURSELVES too: the server trusts the
         // owner unconditionally for this (see handleRotateKeys), and doing
         // so is what lets GET /v1/contexts/pending see us as a keyholder for
@@ -1201,7 +1257,8 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
         rotated = true;
       } catch (e) {
         note(`warning: key rotation after revoke did not fully complete (${(e as Error).message}). ` +
-          `The epoch was advanced and a fresh key is already saved locally here, so re-running should finish the job.`);
+          `The server epoch was advanced, but your local key was left untouched — it still matches what the ` +
+          `server has stored, so re-running 'agentmsg context revoke --id ${id} --user ${uid}' should finish the job.`);
       }
     }
 
