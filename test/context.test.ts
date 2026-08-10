@@ -427,6 +427,35 @@ describe("agentmsg context", () => {
     expect(uploadedEnvelopes).toHaveLength(0);
   });
 
+  // Reviewer finding (task R14, Finding 1): a pending entry can be for a
+  // NEWER epoch than the one our locally held key belongs to (e.g. someone
+  // else revoked and rotated while we still hold the old key). Sealing and
+  // uploading that stale-epoch key would hand the recipient a key that
+  // can't decrypt current content, and the server's never-overwrite guard
+  // on that (context, epoch, installation) slot then permanently blocks any
+  // later correct answer — a silent, unrecoverable lockout. The entry must
+  // be left pending instead, so a keyholder with the CURRENT epoch's key
+  // can answer it. Asserted against the captured request bodies, not stdout
+  // — the point is nothing was ever uploaded, not that nothing was printed.
+  it("never answers a pending entry with a key from a different epoch than the entry", async () => {
+    expect(await cli("register", "--dev-user", "9", "--allow-insecure-http")).toBe(0);
+    await cli("context", "create", "--name", "n"); // saves a local key for epoch 1
+
+    const bobBoxKeys = installationBoxKeys(Buffer.alloc(32, 0x42));
+    membersList = [
+      { github_user_id: "42", role: "writer", added_at: "", installation_id: "install-bob", installation_box_key: bobBoxKeys.publicKey },
+    ];
+    // The pending entry is for epoch 2; our local key is still epoch 1.
+    pendingList = [{ context_id: "c1", epoch: 2, github_user_id: "42", role: "writer", recipient_installation: "install-bob" }];
+
+    const code = await cli("context", "list");
+    expect(code).toBe(0);
+
+    expect(uploadedEnvelopes).toHaveLength(0);
+    const bodies = allRequestBodies.join("\n");
+    expect(bodies).not.toContain("install-bob");
+  });
+
   // R4b: 'share' must seal to the recipient's INSTALLATION box key, derived
   // from a genuinely different installation seed — the way a real second
   // machine's key actually comes into being — not to a keypair fabricated
@@ -570,9 +599,14 @@ describe("agentmsg context", () => {
     });
 
     // The hard requirement: a false security promise is worse than a missing
-    // feature. If rotation cannot run (no local key to re-encrypt with), the
-    // CLI must not claim any protection it did not deliver.
-    it("prints no protection claim when it cannot rotate", async () => {
+    // feature. Bumping the epoch alone has zero cryptographic effect — if we
+    // don't hold the CURRENT epoch's key, we cannot decrypt existing content
+    // to re-encrypt it under a fresh one, so the old revision of this
+    // command advanced the epoch anyway and left the context with content
+    // nobody could read plus a "fresh" key that never matched it (reviewer
+    // finding, task R14, Finding 2). Revoke must now refuse outright:
+    // nothing removed, nothing rotated, epoch untouched.
+    it("refuses to revoke (rather than silently locking the context) when it holds no local key at all", async () => {
       expect(await cli("register", "--dev-user", "9", "--allow-insecure-http")).toBe(0);
       // A context we have no local key for at all (never created/imported
       // here, and no sealed_key available to import either).
@@ -581,10 +615,41 @@ describe("agentmsg context", () => {
       const code = await cli("context", "revoke", "--id", "c1", "--user", "99");
       espy.mockRestore();
 
-      expect(code).toBe(0);
-      expect(removedMembers).toContain("99");
+      expect(code).toBe(1);
+      // The member removal (DELETE /members/99) must never have been sent.
+      expect(removedMembers).not.toContain("99");
       const msg = errs.join("");
       expect(msg).not.toMatch(/protects|no longer decrypts|rotated/i);
+      expect(msg).toMatch(/recover|import-recovery|context get/i);
+    });
+
+    // Same defect, the stale-epoch shape: a local key exists but belongs to
+    // an OLDER epoch than the server's current one (e.g. rotated elsewhere
+    // while we were away, and no envelope has reached us yet to re-import
+    // it). Advancing the epoch further here would compound the lockout —
+    // revoke must fail loudly, telling the user how to recover the current
+    // key, and must not touch the epoch or persist any new key.
+    it("refuses to revoke when the local key is from an older epoch, and leaves the epoch and stored key untouched", async () => {
+      expect(await cli("register", "--dev-user", "9", "--allow-insecure-http")).toBe(0);
+      await cli("context", "create", "--name", "n"); // local key saved for epoch 1
+      const staleKey = new ContextKeys(home).get("c1")!;
+      // Server has moved on to epoch 2 (e.g. another member ran `revoke`)
+      // and no envelope for it has reached us yet.
+      ctxEpoch = 2;
+      ctxSealedKey = "";
+
+      const errs: string[] = [];
+      const espy = vi.spyOn(process.stderr, "write").mockImplementation((c: any) => (errs.push(String(c)), true));
+      const code = await cli("context", "revoke", "--id", "c1", "--user", "99");
+      espy.mockRestore();
+
+      expect(code).toBe(1);
+      expect(removedMembers).not.toContain("99"); // never called removeContextMember
+      expect(ctxEpoch).toBe(2); // unchanged by this command (it only bumps inside the DELETE handler)
+      expect(new ContextKeys(home).get("c1")).toBe(staleKey); // no fresh key persisted
+      const msg = errs.join("");
+      expect(msg).toMatch(/older epoch/i);
+      expect(msg).toMatch(/recover|import-recovery|context get/i);
     });
 
     // The propagation gap this task closes: rotation must reach a remaining

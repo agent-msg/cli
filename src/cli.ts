@@ -898,8 +898,20 @@ async function answerPendingContextKeys(
     for (const p of pending) {
       if (!p?.context_id || !p.recipient_installation) continue;
       if (selfInstallationId && p.recipient_installation === selfInstallationId) continue;
-      const key = keys.get(p.context_id);
-      if (!key) continue; // we can't answer for a context we hold no key for
+      const entry = keys.getEntry(p.context_id);
+      if (!entry) continue; // we can't answer for a context we hold no key for
+      // Critical: the pending entry names the epoch it needs answered for.
+      // A locally held key from a DIFFERENT epoch (older — e.g. we haven't
+      // caught up to a rotation yet, or in principle any mismatch at all)
+      // must never be sealed and uploaded for it. The server refuses to
+      // overwrite an existing envelope in a (context, epoch, installation)
+      // slot, so answering with the wrong key doesn't just fail to help —
+      // it permanently blocks any later CORRECT answer to that exact slot,
+      // leaving the recipient locked out with no recovery path. Leave it
+      // pending instead, so a keyholder who actually has the current
+      // epoch's key can answer it.
+      if (entry.epoch !== p.epoch) continue;
+      const key = entry.key;
       const boxKey = await boxKeyFor(p.context_id, p.recipient_installation);
       if (!boxKey) continue;
       const sealedKey = await seal(key, boxKey);
@@ -1112,19 +1124,40 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
       note("usage: agentmsg context revoke --id ID --user GITHUB_USER_ID");
       return 2;
     }
-    const oldEntry = keys.getEntry(id);
+    // Honest revoke, checked BEFORE we touch anything server-side:
+    // removeContextMember always bumps the epoch (see the server's
+    // handleRemoveContextMember), and bumping the epoch alone has zero
+    // cryptographic effect — the removed member's old key still opens
+    // anything written afterward unless the content is actually
+    // re-encrypted under a fresh key they never receive. That re-encryption
+    // needs the CURRENT epoch's key to decrypt the existing content first.
+    // If our local key is stale (an older epoch) or absent, we must refuse
+    // outright rather than advance the epoch anyway: doing so would leave
+    // the context with content nobody can decrypt plus a "fresh" key that
+    // never matched what was actually stored — silent, unrecoverable data
+    // loss dressed up as a successful command. Try to resolve/import the
+    // current key first (the same path `get`/`set`/`export-recovery` use),
+    // and fail loudly — no removeContextMember call, no epoch bump, no key
+    // saved — if we still don't have a current one.
+    const resolved = await resolveContextKey(client, keys, boxKeys, id);
+    if (!resolved.key) {
+      note(
+        `error: cannot revoke on context ${id} — your local key is ${resolved.stale ? "from an older epoch" : "missing"}, ` +
+          `so there is nothing to safely re-encrypt the existing content with. ` +
+          `Recover the current key first — run 'agentmsg context get --id ${id}' to import a fresh envelope, ` +
+          `or 'agentmsg context import-recovery' if you have a recovery code — then retry revoke.`,
+      );
+      return 1;
+    }
+    const oldKey = resolved.key;
     const c = await client.removeContextMember(id, uid);
 
-    // Honest revoke: bumping the epoch alone has zero cryptographic effect —
-    // the removed member's old key still opens anything written afterward
-    // unless the content is actually re-encrypted under a fresh key they
-    // never receive. We can only do that if we hold the OLD key locally
-    // (needed to decrypt existing content before re-encrypting it); if we
-    // don't, we fall through having advanced the epoch but rotated nothing,
-    // and print no claim of protection — a false security promise is worse
-    // than a missing feature.
+    // We now know (from the check above) that we hold the pre-revoke
+    // CURRENT key, so rotation always attempts to run — a failure past this
+    // point is a network/partial-completion issue, not "we never had the
+    // key to begin with".
     let rotated = false;
-    if (oldEntry) {
+    {
       const freshKey = await generateContextKey();
       // Commit the fresh key to LOCAL storage before any of the network
       // calls below that could fail partway through. This is what keeps
@@ -1139,9 +1172,9 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
       keys.save(id, freshKey, c.epoch);
       try {
         const full = await client.getContext(id);
-        if (full.download_url && oldEntry.key) {
+        if (full.download_url) {
           const ct = await client.download(new URL(full.download_url).pathname);
-          const plaintext = await decryptSym(Buffer.from(ct).toString("utf8"), oldEntry.key);
+          const plaintext = await decryptSym(Buffer.from(ct).toString("utf8"), oldKey);
           const newCt = Buffer.from(await encryptSym(plaintext, freshKey), "utf8");
           const sha256 = createHash("sha256").update(newCt).digest("hex");
           const ticket = await client.putContext(id, full.version, newCt.length, sha256);
