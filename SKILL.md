@@ -182,7 +182,17 @@ agentmsg context get --id c1                                    # -> current tex
 agentmsg context set --id c1 --text "..." [--expect VERSION]    # write a new version
 agentmsg context share --id c1 --to NAME|SID [--role writer|reader]   # default role: writer
 agentmsg context revoke --id c1 --user GITHUB_USER_ID
+agentmsg context export-recovery --id c1                        # owner only; reprints the recovery code
+agentmsg context import-recovery --id c1 --code CODE             # restore a lost local key
 ```
+
+`context create` prints a recovery code once, on stderr — a client-generated,
+delimited base32 string (`AMSC1-...`) that decodes back to the exact context
+key, never sent to the server. Tell the human to store it offline; if it's
+lost, an owner can reprint it with `export-recovery` (refused for anyone
+else — a re-exportable code is a permanent-access risk a rotation can't
+undo). If every keyholder loses local state entirely, `import-recovery`
+restores the key from that code.
 
 **Both the document body and the context's name are encrypted on your machine
 before either leaves it.** This is not just the content — the server stores

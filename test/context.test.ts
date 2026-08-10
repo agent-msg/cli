@@ -28,6 +28,14 @@ let pendingList: unknown[] = [];
 let uploadedEnvelopes: { context_id: string; envelopes: { recipient_installation: string; sealed_key: string }[] }[] = [];
 let removedMembers: string[] = [];
 let addedMembers: { github_user_id: string; role: string; recipient_installation: string; sealed_key: string }[] = [];
+// The role the fake server reports for the calling user on context c1.
+// Defaults to "owner" (as a real creator would see); tests that need to
+// exercise the export-recovery owner-only check flip this to something else.
+let ctxRole = "owner";
+// Every raw request body this fake server ever received, in order. Used to
+// prove a value (like a recovery code) genuinely never left the machine —
+// checking stdout/stderr is not sufficient, only the wire is.
+let allRequestBodies: string[] = [];
 
 beforeEach(async () => {
   ctxVersion = 0;
@@ -40,10 +48,13 @@ beforeEach(async () => {
   uploadedEnvelopes = [];
   removedMembers = [];
   addedMembers = [];
+  ctxRole = "owner";
+  allRequestBodies = [];
   server = createServer((req, res) => {
     let b = "";
     req.on("data", (c) => (b += c));
     req.on("end", () => {
+      allRequestBodies.push(b);
       // The /upload PUT carries binary ciphertext, not JSON — parsing it
       // unconditionally would crash this handler and hang the request.
       let body: any = {};
@@ -69,7 +80,7 @@ beforeEach(async () => {
         return res.end(JSON.stringify({ id: "c1", name_enc: body.name_enc, owner_uid: "1", epoch: ctxEpoch, version: 0, bytes: 0, updated_at: "", role: "owner" }));
       }
       if (req.url === "/v1/contexts" && req.method === "GET") {
-        return res.end(JSON.stringify([{ id: "c1", name_enc: lastNameEnc, owner_uid: "1", epoch: ctxEpoch, version: ctxVersion, bytes: ctxHasContent ? 1 : 0, updated_at: "", role: "owner" }]));
+        return res.end(JSON.stringify([{ id: "c1", name_enc: lastNameEnc, owner_uid: "1", epoch: ctxEpoch, version: ctxVersion, bytes: ctxHasContent ? 1 : 0, updated_at: "", role: ctxRole }]));
       }
       if (req.url === "/v1/contexts/pending" && req.method === "GET") {
         return res.end(JSON.stringify(pendingList));
@@ -94,7 +105,7 @@ beforeEach(async () => {
       if (req.url === "/v1/contexts/c1" && req.method === "GET") {
         return res.end(JSON.stringify({
           id: "c1", name_enc: "", owner_uid: "1", epoch: ctxEpoch, version: ctxVersion,
-          bytes: ctxHasContent ? 1 : 0, updated_at: "", role: "owner",
+          bytes: ctxHasContent ? 1 : 0, updated_at: "", role: ctxRole,
           download_url: ctxHasContent ? base + "/download-content" : undefined,
           sealed_key: ctxSealedKey || undefined,
         }));
@@ -478,6 +489,145 @@ describe("agentmsg context", () => {
       expect(removedMembers).toContain("99");
       const msg = errs.join("");
       expect(msg).not.toMatch(/protects|no longer decrypts|rotated/i);
+    });
+  });
+
+  // R5 — the recovery code: generated client-side from the key `create`
+  // already holds, shown once, and never uploaded anywhere. See
+  // docs/shared-context-keys.html §"恢复码：借用 AK/SK 的模式，但只借一半".
+  describe("recovery code", () => {
+    it("prints the recovery code exactly once, in a distinct block, on create", async () => {
+      expect(await cli("register", "--dev-user", "9", "--allow-insecure-http")).toBe(0);
+      const errs: string[] = [];
+      const espy = vi.spyOn(process.stderr, "write").mockImplementation((c: any) => (errs.push(String(c)), true));
+      const code = await cli("context", "create", "--name", "team notes");
+      espy.mockRestore();
+
+      expect(code).toBe(0);
+      const msg = errs.join("");
+      // A visually distinct block with the required warning.
+      expect(msg).toMatch(/recovery code/i);
+      expect(msg).toMatch(/restore.*(entire|whole|all).*context|context.*(entire|whole|all).*restore/i);
+      expect(msg).toMatch(/not.*(store|save|paste).*online|offline/i);
+      const match = msg.match(/AMSC1-[0-9A-Z-]+/);
+      expect(match).toBeTruthy();
+      // Shown exactly once: the block header appears once per create call.
+      expect((msg.match(/RECOVERY CODE/gi) || []).length).toBe(1);
+    });
+
+    it("never sends the recovery code to the server — checked against captured request bodies", async () => {
+      expect(await cli("register", "--dev-user", "9", "--allow-insecure-http")).toBe(0);
+      const errs: string[] = [];
+      const espy = vi.spyOn(process.stderr, "write").mockImplementation((c: any) => (errs.push(String(c)), true));
+      const code = await cli("context", "create", "--name", "team notes");
+      espy.mockRestore();
+      expect(code).toBe(0);
+
+      const printedCode = errs.join("").match(/AMSC1-[0-9A-Z-]+/)?.[0];
+      expect(printedCode).toBeTruthy();
+      // Also check the raw base64 key itself, not just its recovery-code
+      // encoding — belt and suspenders on the property the whole design
+      // rests on.
+      const rawKey = new ContextKeys(home).get("c1")!;
+      for (const body of allRequestBodies) {
+        expect(body).not.toContain(printedCode);
+        expect(body).not.toContain(rawKey);
+      }
+    });
+
+    it("a second create for a different context prints a different code", async () => {
+      expect(await cli("register", "--dev-user", "9", "--allow-insecure-http")).toBe(0);
+      const errs1: string[] = [];
+      let espy = vi.spyOn(process.stderr, "write").mockImplementation((c: any) => (errs1.push(String(c)), true));
+      await cli("context", "create", "--name", "first");
+      espy.mockRestore();
+
+      const errs2: string[] = [];
+      espy = vi.spyOn(process.stderr, "write").mockImplementation((c: any) => (errs2.push(String(c)), true));
+      await cli("context", "create", "--name", "second");
+      espy.mockRestore();
+
+      const code1 = errs1.join("").match(/AMSC1-[0-9A-Z-]+/)?.[0];
+      const code2 = errs2.join("").match(/AMSC1-[0-9A-Z-]+/)?.[0];
+      expect(code1).toBeTruthy();
+      expect(code2).toBeTruthy();
+      expect(code1).not.toBe(code2);
+    });
+
+    it("export-recovery re-derives the same code the owner would have seen at creation", async () => {
+      expect(await cli("register", "--dev-user", "9", "--allow-insecure-http")).toBe(0);
+      const createErrs: string[] = [];
+      let espy = vi.spyOn(process.stderr, "write").mockImplementation((c: any) => (createErrs.push(String(c)), true));
+      await cli("context", "create", "--name", "n");
+      espy.mockRestore();
+      const createdCode = createErrs.join("").match(/AMSC1-[0-9A-Z-]+/)?.[0];
+
+      const exportErrs: string[] = [];
+      espy = vi.spyOn(process.stderr, "write").mockImplementation((c: any) => (exportErrs.push(String(c)), true));
+      const code = await cli("context", "export-recovery", "--id", "c1");
+      espy.mockRestore();
+
+      expect(code).toBe(0);
+      const exportedCode = exportErrs.join("").match(/AMSC1-[0-9A-Z-]+/)?.[0];
+      expect(exportedCode).toBe(createdCode);
+    });
+
+    it("export-recovery is refused for a non-owner, with no code printed", async () => {
+      expect(await cli("register", "--dev-user", "9", "--allow-insecure-http")).toBe(0);
+      await cli("context", "create", "--name", "n"); // we hold the key locally
+      ctxRole = "writer"; // ...but the server now says we're not the owner
+
+      const errs: string[] = [];
+      const espy = vi.spyOn(process.stderr, "write").mockImplementation((c: any) => (errs.push(String(c)), true));
+      const code = await cli("context", "export-recovery", "--id", "c1");
+      espy.mockRestore();
+
+      expect(code).toBe(1);
+      const msg = errs.join("");
+      expect(msg).toMatch(/owner/i);
+      expect(msg).not.toMatch(/AMSC1-/);
+    });
+
+    it("import-recovery restores the key into a fresh local store that lost all state", async () => {
+      expect(await cli("register", "--dev-user", "9", "--allow-insecure-http")).toBe(0);
+      const createErrs: string[] = [];
+      const espy = vi.spyOn(process.stderr, "write").mockImplementation((c: any) => (createErrs.push(String(c)), true));
+      await cli("context", "create", "--name", "n");
+      espy.mockRestore();
+      const originalKey = new ContextKeys(home).get("c1")!;
+      const recoveryCode = createErrs.join("").match(/AMSC1-[0-9A-Z-]+/)?.[0]!;
+      expect(recoveryCode).toBeTruthy();
+
+      // Simulate every keyholder having lost local state: a brand new home
+      // with no contexts.json at all, registering fresh.
+      const home2 = mkdtempSync(join(tmpdir(), "amsg-ctx-fresh-"));
+      try {
+        process.env.AGENTMSG_HOME = home2;
+        process.env.AGENTMSG_SERVER = base;
+        delete process.env.AGENTMSG_PROFILE;
+        expect(await run(["register", "--dev-user", "9", "--allow-insecure-http"])).toBe(0);
+        expect(new ContextKeys(home2).get("c1")).toBeUndefined(); // precondition: no local key at all
+
+        const code = await run(["context", "import-recovery", "--id", "c1", "--code", recoveryCode]);
+        expect(code).toBe(0);
+        expect(new ContextKeys(home2).get("c1")).toBe(originalKey);
+      } finally {
+        delete process.env.AGENTMSG_HOME;
+        delete process.env.AGENTMSG_SERVER;
+        rmSync(home2, { recursive: true, force: true });
+      }
+    });
+
+    it("import-recovery gives a clear error (not a crash) for a garbled code", async () => {
+      expect(await cli("register", "--dev-user", "9", "--allow-insecure-http")).toBe(0);
+      const errs: string[] = [];
+      const espy = vi.spyOn(process.stderr, "write").mockImplementation((c: any) => (errs.push(String(c)), true));
+      const code = await cli("context", "import-recovery", "--id", "c1", "--code", "not-a-real-code");
+      espy.mockRestore();
+
+      expect(code).toBe(1);
+      expect(errs.join("")).toMatch(/invalid|checksum|malformed/i);
+      expect(new ContextKeys(home).get("c1")).toBeUndefined();
     });
   });
 });

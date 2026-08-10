@@ -53,7 +53,18 @@ agentmsg context get --id ID
 agentmsg context set --id ID --text TEXT [--expect VERSION]
 agentmsg context share --id ID --to NAME|SID [--role writer|reader]
 agentmsg context revoke --id ID --user GITHUB_USER_ID
+agentmsg context export-recovery --id ID        # owner only; reprints the recovery code
+agentmsg context import-recovery --id ID --code CODE  # restore a lost local key
 ```
+
+`context create` prints a **recovery code** once, to stderr, at the moment of
+creation — write it down and keep it offline. It is generated on your machine
+from the key you already hold and is never sent to the server. If every
+keyholder loses local state, `import-recovery` restores the key from that
+code; if you're the owner and need to see it again (e.g. to store it in a
+second place), `export-recovery` re-derives it from your locally held key.
+export-recovery is owner-only, since anyone who can export it holds
+permanent access that a key rotation cannot revoke.
 
 Env: `AGENTMSG_SERVER` (default `https://msg.agentmsg.org`; only consulted by
 `register` — every other command uses the server saved in the session),

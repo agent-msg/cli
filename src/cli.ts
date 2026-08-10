@@ -22,6 +22,7 @@ import { InstallationStore } from "./installation.js";
 import { installationBoxKeys, InstallationBoxKeys } from "./installation-box.js";
 import { CLI_VERSION, registerGuestFirst } from "./guest.js";
 import { ContextKeys } from "./context.js";
+import { encodeRecoveryCode, decodeRecoveryCode } from "./recovery.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -46,6 +47,8 @@ Usage:
   agentmsg unregister
   agentmsg skill install [--target claude|codex|all] [--force]
   agentmsg context create|list|get|set|share|revoke  shared context (E2EE)
+  agentmsg context export-recovery --id ID              owner only; reprints the recovery code
+  agentmsg context import-recovery --id ID --code CODE  restore a lost local key from a recovery code
 
 Env: AGENTMSG_SERVER (default https://msg.agentmsg.org; read only by 'register' —
 other commands use the server saved in the session), AGENTMSG_HOME, AGENTMSG_PROFILE
@@ -115,6 +118,29 @@ function compactCard(s: Session): string {
 }
 function note(msg: string): void {
   process.stderr.write(msg + "\n");
+}
+
+// The recovery code for a shared context is shown here and ONLY here (at
+// `create`, and again on an owner-invoked `export-recovery`) — never logged,
+// never included in emit()'s machine-readable JSON on stdout, and never sent
+// anywhere. See src/recovery.ts and docs/shared-context-keys.html for why:
+// the code is generated client-side from a key the server has never seen, and
+// that property only holds if nothing ever puts the code on the wire.
+function printRecoveryCode(contextId: string, keyB64: string): void {
+  const code = encodeRecoveryCode(keyB64);
+  const bar = "=".repeat(70);
+  note("");
+  note(bar);
+  note(`RECOVERY CODE for context ${contextId} — shown once, right now.`);
+  note("");
+  note(`    ${code}`);
+  note("");
+  note("This code can restore the ENTIRE context. Write it down or store it");
+  note("somewhere offline (paper, a safe, an offline password manager). Do NOT");
+  note("paste it into chat, email, a repo, or anywhere else connected to the");
+  note("internet — anyone who has it can decrypt everything in this context.");
+  note(bar);
+  note("");
 }
 
 function cmdSkill(args: ReturnType<typeof parseArgs>): number {
@@ -884,6 +910,10 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
     const key = await generateContextKey();
     const c = await client.createContext(await encryptSym(name, key));
     keys.save(c.id, key, c.epoch);
+    // Shown once, right now — at the moment of creation, when the user's
+    // attention is actually on this context and they're the one responsible
+    // for it. Not an afterthought command the user has to think to run.
+    printRecoveryCode(c.id, key);
     emit({ context_id: c.id, version: c.version, epoch: c.epoch });
     return 0;
   }
@@ -1110,7 +1140,65 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
     return 0;
   }
 
-  note("usage: agentmsg context create|list|get|set|share|revoke");
+  if (sub === "export-recovery") {
+    const id = String(args.flags.id || "");
+    if (!id) {
+      note("usage: agentmsg context export-recovery --id ID");
+      return 2;
+    }
+    const c = await client.getContext(id);
+    // Owner-only, by design: any keyholder could otherwise re-export the
+    // recovery code, and a departing member who did so would keep permanent
+    // full access that a subsequent key rotation cannot revoke (rotation
+    // only stops NEW envelopes reaching them — it does nothing about a
+    // recovery code they already hold). The role check trusts the server's
+    // membership record, the one thing the server DOES get to decide.
+    if (c.role !== "owner") {
+      note(`error: export-recovery is owner-only — the server reports your role on context ${id} as "${c.role ?? "unknown"}".`);
+      note("   Ask the context owner to export and share it with you instead.");
+      return 1;
+    }
+    const resolved = await resolveContextKey(client, keys, boxKeys, id, c);
+    if (!resolved.key) {
+      note(noLocalKeyMessage(id, resolved));
+      return 1;
+    }
+    printRecoveryCode(id, resolved.key);
+    emit({ context_id: id, epoch: c.epoch });
+    return 0;
+  }
+
+  if (sub === "import-recovery") {
+    const id = String(args.flags.id || "");
+    const code = args.flags.code !== undefined ? String(args.flags.code) : "";
+    if (!id || !code) {
+      note("usage: agentmsg context import-recovery --id ID --code CODE");
+      return 2;
+    }
+    let key: string;
+    try {
+      key = decodeRecoveryCode(code);
+    } catch (e) {
+      note(`error: ${(e as Error).message}`);
+      return 1;
+    }
+    // Best-effort epoch lookup: restoring the key locally is the whole point
+    // of this command (it's meant to work even when things are in a bad
+    // state), so a server that's unreachable right now must not block it —
+    // the entry is simply saved with an "unknown" epoch, which downstream
+    // reads already treat as needing a freshness check (see context.ts).
+    let epoch: number | undefined;
+    try {
+      epoch = (await client.getContext(id)).epoch;
+    } catch {
+      // fall through with epoch left undefined
+    }
+    keys.save(id, key, epoch);
+    emit({ context_id: id, epoch, status: "restored" });
+    return 0;
+  }
+
+  note("usage: agentmsg context create|list|get|set|share|revoke|export-recovery|import-recovery");
   return 2;
 }
 
