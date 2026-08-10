@@ -391,7 +391,7 @@ async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionSto
         }
         let r;
         try {
-          r = await client.register(credential);
+          r = await client.register(credential, installationBoxKey);
         } finally {
           credential = "";
         }

@@ -366,8 +366,11 @@ export class Client {
     return (raw ? JSON.parse(raw) : {}) as T;
   }
 
-  register(credential: string): Promise<RegisterResponse> {
-    return this.call("POST", "/v1/register", { credential });
+  register(credential: string, installationBoxKey?: string): Promise<RegisterResponse> {
+    return this.call("POST", "/v1/register", {
+      credential,
+      ...(installationBoxKey ? { installation_box_key: installationBoxKey } : {}),
+    });
   }
 
   guestChallenge(input: GuestChallengeRequest): Promise<GuestChallengeResponse> {

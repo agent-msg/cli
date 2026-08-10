@@ -290,31 +290,24 @@ suite("shared-context & product acceptance stories (real server, real CLI)", () 
     },
   );
 
-  // KNOWN REAL DEFECT (found by this suite, not fixed here — see task report
-  // task-R11-report.md): this story is expected to FAIL red against the real
-  // server. `context revoke`'s self-key-delivery step
-  // (uploadContextKeys(id, [{recipient_installation: selfInstallationId, ...}]))
-  // always gets 403 recipient_not_member from the server, because
-  // ContextMember.RecipientInstallation is NEVER populated for the owner's
-  // own row (see api_context.go's handleCreateContext, and the doc comment
-  // on ContextMember.RecipientInstallation: "empty for the owner row, who
-  // never registers a RecipientInstallation") — so handleRotateKeys's
-  // validRecipient set can never contain the owner's own installation. That
-  // throw aborts cmdContext's revoke handler BEFORE it reaches
-  // answerPendingContextKeys, so a remaining member's envelope for the new
-  // epoch is never delivered by the revoke call. Worse: it doesn't
-  // self-heal on a later command either — handleListPendingContextKeys
-  // requires the answering caller to already hold a SERVER-STORED envelope
-  // for their own installation at the current epoch (GetContextKey check),
-  // which the owner can never obtain, so every subsequent piggyback attempt
-  // by the owner also silently finds nothing pending. A locally-held key is
-  // not enough. Net effect: after any revoke with 2+ remaining members, the
-  // remaining non-acting members are permanently locked out of the rotated
-  // content, with no user-visible error — this is a total, unconditional
-  // regression (contexts require a non-guest owner, and no owner's
-  // ContextMember row is ever registered with a RecipientInstallation), not
-  // a rare edge case. This is exactly the class of defect a 200-line fake
-  // /commit double could never catch.
+  // Regression coverage for task R12: `context revoke`'s self-key-delivery
+  // step (uploadContextKeys(id, [{recipient_installation: selfInstallationId,
+  // ...}])) used to get 403 recipient_not_member from the server, because
+  // ContextMember.RecipientInstallation was never populated for the owner's
+  // own row (see api_context.go's handleCreateContext). handleRotateKeys'
+  // validRecipient set could then never contain the owner's own installation,
+  // that throw aborted cmdContext's revoke handler BEFORE it reached
+  // answerPendingContextKeys, and it did not self-heal on a later command
+  // either — handleListPendingContextKeys requires the answering caller to
+  // already hold a SERVER-STORED envelope for their own installation at the
+  // current epoch, which the owner could never obtain. Net effect: after any
+  // revoke with 2+ remaining members, the remaining non-acting members were
+  // permanently locked out of the rotated content, with no user-visible
+  // error. Fixed by having handleCreateContext populate the owner's
+  // RecipientInstallation from the creating session's installation id, and
+  // by rejecting an empty RecipientInstallation at the store boundary (see
+  // Mem/pg.Store CreateContext / AddContextMember) so this can't regress
+  // silently again.
   story(
     "4. removal: A removes B and rotates; B cannot read new content; every remaining member still can, including one not in A's contact book",
     async () => {
@@ -406,9 +399,9 @@ suite("shared-context & product acceptance stories (real server, real CLI)", () 
     },
   );
 
-  // KNOWN REAL DEFECT: same root cause as story 4 (see the comment above it)
-  // — the revoke that should trigger B's automatic recovery never completes
-  // its piggyback delivery, so this story is expected to FAIL red too.
+  // Regression coverage for task R12: same root cause as story 4 (see the
+  // comment above it) — before the fix, the revoke that should trigger B's
+  // automatic recovery never completed its piggyback delivery.
   story("6. a stale local key after a rotation recovers automatically", async () => {
     const a = home("s6-a");
     const b = home("s6-b");
