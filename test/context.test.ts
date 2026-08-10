@@ -36,6 +36,10 @@ let ctxRole = "owner";
 // prove a value (like a recovery code) genuinely never left the machine —
 // checking stdout/stderr is not sufficient, only the wire is.
 let allRequestBodies: string[] = [];
+// Counts /v1/register calls with a non-default credential, so distinct
+// identities registering against this fake server get distinct
+// session/installation ids (see the /v1/register handler below).
+let registerCount = 0;
 
 beforeEach(async () => {
   ctxVersion = 0;
@@ -50,6 +54,7 @@ beforeEach(async () => {
   addedMembers = [];
   ctxRole = "owner";
   allRequestBodies = [];
+  registerCount = 0;
   server = createServer((req, res) => {
     let b = "";
     req.on("data", (c) => (b += c));
@@ -65,14 +70,42 @@ beforeEach(async () => {
       }
       res.setHeader("Content-Type", "application/json");
       if (req.url === "/v1/register") {
-        return res.end(JSON.stringify({ session_id: "s1", token: "t1", github_login: "u", github_user_id: "1" }));
-      }
-      if (req.url === "/v1/whoami/card" && req.method === "GET") {
+        // Mirrors the real handleRegister (api.go): every registration binds
+        // a real installation and the response now carries installation_id
+        // (the R8 fix). The default dev-user credential "9" keeps the
+        // long-standing session_id/installation_id/github_user_id the rest
+        // of this file's tests were written against; any other credential
+        // (used by the identity-round-trip test below, to model a genuinely
+        // separate person/machine registering) gets its own distinct triple,
+        // the same way two real registrations against the real server would.
+        const credential = String(body.credential ?? "");
+        registerCount++;
+        if (credential === "9") {
+          return res.end(JSON.stringify({
+            session_id: "s1", token: "t1", github_login: "u", github_user_id: "1",
+            installation_id: "install-self",
+          }));
+        }
         return res.end(JSON.stringify({
-          version: 1, service: "agentmsg", identity_type: "github", principal_id: "1",
-          installation_id: "install-self", session_id: "s1", verified: true,
-          public_key: "", signature: "", github_user_id: "1", github_login: "u",
+          session_id: `s-reg${registerCount}`, token: `t-reg${registerCount}`,
+          github_login: `user${registerCount}`, github_user_id: `${1000 + registerCount}`,
+          installation_id: `install-reg${registerCount}`,
         }));
+      }
+      // The real server's handleAddressCard (api_verified.go) 404s with
+      // address_card_unavailable whenever GetAddressCardMaterial finds
+      // nothing — which is exactly the case for every session in this file,
+      // since all of them register through the legacy /v1/register path
+      // (--dev-user), which creates an installation but never the
+      // challenge/address-card material the guest flow creates. A double
+      // that answered this unconditionally (as this fake used to) is more
+      // permissive than production and hides exactly the bug this endpoint
+      // exists to catch: it must fail here too, the same way, so the CLI's
+      // fallback-to-server path is only ever exercised the way it really
+      // will be.
+      if (req.url === "/v1/whoami/card" && req.method === "GET") {
+        res.statusCode = 404;
+        return res.end(JSON.stringify({ error: "address_card_unavailable", message: "address card is unavailable" }));
       }
       if (req.url === "/v1/contexts" && req.method === "POST") {
         lastNameEnc = String(body.name_enc ?? "");
@@ -629,6 +662,201 @@ describe("agentmsg context", () => {
       expect(errs.join("")).toMatch(/invalid|checksum|malformed/i);
       expect(new ContextKeys(home).get("c1")).toBeUndefined();
     });
+  });
+});
+
+// R8 end-to-end: two genuinely distinct identities register, exchange real
+// address cards, and share a context — with nothing on the identity path
+// fabricated by the test. This is the regression test for the bug this task
+// exists to fix: POST /v1/register's response omitted installation_id, so
+// `session.installationId` was never populated for the verified/--dev-user
+// path, `compactCard()` emitted a card with no installation id, and `contact
+// add --card` stored `installationId: ""` — which made `context share`
+// refuse for a brand-new installation with "this contact's card predates
+// installation identity". Every other sharing test in this file fabricates
+// the recipient's installation id/box key by hand (installationBoxKeys(seed)
+// + Contacts.add() directly), which is exactly why none of them caught this:
+// the bug lives entirely in the register -> card -> contact-add plumbing
+// that those tests skip. This test drives that plumbing for real, for BOTH
+// parties, using two separate home directories so their installation seeds
+// are independently random — the same as two real machines — and would have
+// failed (share refusing with "predates installation identity") before the
+// fix in src/cli.ts's cmdRegister.
+describe("end-to-end sharing between two real registrations (no fabricated identity)", () => {
+  it("self shares a context with peer via register -> card -> contact add -> share, and peer decrypts it", async () => {
+    // A dedicated fake server for this test: unlike the shared one above, it
+    // must route sealed_key by the CALLING installation (via bearer token),
+    // the way the real server's handleGetContext does with
+    // sess.InstallationID — because self and peer are two different callers
+    // who must see two different envelopes for the same context.
+    const regs = new Map<string, { installationId: string; githubUserId: string; sessionId: string }>();
+    let regCounter = 0;
+    const ctx = { nameEnc: "", version: 0, epoch: 1, content: "", hasContent: false };
+    const sealedKeys = new Map<string, string>(); // installationId -> sealed_key
+    let e2eServer: Server;
+    let e2eBase = "";
+
+    await new Promise<void>((resolve) => {
+      e2eServer = createServer((req, res) => {
+        let b = "";
+        req.on("data", (c) => (b += c));
+        req.on("end", () => {
+          let body: any = {};
+          try {
+            body = b ? JSON.parse(b) : {};
+          } catch {
+            body = {};
+          }
+          res.setHeader("Content-Type", "application/json");
+          const authHeader = req.headers["authorization"];
+          const token = typeof authHeader === "string" && authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+          const caller = regs.get(token);
+
+          if (req.url === "/v1/register" && req.method === "POST") {
+            regCounter++;
+            const reg = {
+              installationId: `ins_e2e${regCounter}`,
+              githubUserId: `${9000 + regCounter}`,
+              sessionId: `ses_e2e${regCounter}`,
+            };
+            const newToken = `tok_e2e${regCounter}`;
+            regs.set(newToken, reg);
+            return res.end(JSON.stringify({
+              session_id: reg.sessionId, token: newToken, github_login: `user${regCounter}`,
+              github_user_id: reg.githubUserId, installation_id: reg.installationId,
+            }));
+          }
+          // Presigned upload/download URLs carry no bearer token (the URL
+          // itself is the capability — see Client.uploadPut/download), so
+          // these must be handled before the auth gate below.
+          if (req.url === "/upload") {
+            ctx.content = b;
+            ctx.hasContent = true;
+            return res.end("{}");
+          }
+          if (req.url === "/download-content" && req.method === "GET") {
+            return res.end(ctx.content);
+          }
+          if (!caller) {
+            res.statusCode = 401;
+            return res.end(JSON.stringify({ error: "unauthenticated", message: "unauthenticated" }));
+          }
+          // Mirrors production: the legacy register path never creates
+          // address-card material, so this always 404s for these sessions.
+          if (req.url === "/v1/whoami/card" && req.method === "GET") {
+            res.statusCode = 404;
+            return res.end(JSON.stringify({ error: "address_card_unavailable" }));
+          }
+          if (req.url === "/v1/contexts/pending" && req.method === "GET") {
+            return res.end(JSON.stringify([]));
+          }
+          if (req.url === "/v1/contexts" && req.method === "POST") {
+            ctx.nameEnc = String(body.name_enc ?? "");
+            ctx.epoch = 1;
+            ctx.version = 0;
+            return res.end(JSON.stringify({
+              id: "c1", name_enc: ctx.nameEnc, owner_uid: caller.githubUserId,
+              epoch: ctx.epoch, version: ctx.version, bytes: 0, updated_at: "", role: "owner",
+            }));
+          }
+          if (req.url === "/v1/contexts/c1" && req.method === "GET") {
+            return res.end(JSON.stringify({
+              id: "c1", name_enc: ctx.nameEnc, owner_uid: "", epoch: ctx.epoch, version: ctx.version,
+              bytes: ctx.hasContent ? 1 : 0, updated_at: "", role: "writer",
+              download_url: ctx.hasContent ? e2eBase + "/download-content" : undefined,
+              sealed_key: sealedKeys.get(caller.installationId),
+            }));
+          }
+          if (req.url === "/v1/contexts/c1" && req.method === "PUT") {
+            return res.end(JSON.stringify({ upload_url: e2eBase + "/upload", blob_key: "k" }));
+          }
+          if (req.url === "/v1/contexts/c1/commit" && req.method === "POST") {
+            if (body.expected_version !== ctx.version) {
+              res.statusCode = 409;
+              return res.end(JSON.stringify({ error: "version_conflict", current_version: ctx.version }));
+            }
+            ctx.version++;
+            return res.end(JSON.stringify({
+              id: "c1", name_enc: ctx.nameEnc, owner_uid: "", epoch: ctx.epoch, version: ctx.version,
+              bytes: ctx.content.length, updated_at: "", role: "owner",
+            }));
+          }
+          if (req.url === "/v1/contexts/c1/members" && req.method === "POST") {
+            if (body.sealed_key && body.recipient_installation) {
+              sealedKeys.set(String(body.recipient_installation), String(body.sealed_key));
+            }
+            return res.end(JSON.stringify({ status: "added" }));
+          }
+          res.end("{}");
+        });
+      });
+      e2eServer.listen(0, () => resolve());
+    });
+    const addr = e2eServer!.address();
+    e2eBase = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}`;
+
+    const selfHome = mkdtempSync(join(tmpdir(), "amsg-e2e-self-"));
+    const peerHome = mkdtempSync(join(tmpdir(), "amsg-e2e-peer-"));
+    async function cliAs(h: string, ...argv: string[]) {
+      process.env.AGENTMSG_HOME = h;
+      process.env.AGENTMSG_SERVER = e2eBase;
+      delete process.env.AGENTMSG_PROFILE;
+      const code = await run(argv);
+      delete process.env.AGENTMSG_HOME;
+      delete process.env.AGENTMSG_SERVER;
+      return code;
+    }
+    async function cliCapture(h: string, ...argv: string[]): Promise<{ code: number; out: string }> {
+      const out: string[] = [];
+      const spy = vi.spyOn(process.stdout, "write").mockImplementation((c: any) => (out.push(String(c)), true));
+      let code: number;
+      try {
+        code = await cliAs(h, ...argv);
+      } finally {
+        spy.mockRestore();
+      }
+      return { code, out: out.join("") };
+    }
+
+    try {
+      expect(await cliAs(selfHome, "register", "--dev-user", "1", "--allow-insecure-http")).toBe(0);
+      expect(await cliAs(peerHome, "register", "--dev-user", "2", "--allow-insecure-http")).toBe(0);
+
+      // Peer produces their OWN card exactly as a user would (`agentmsg
+      // card`) — not a hand-built Contacts.add() call. This is the exact
+      // path that used to emit `iid: undefined` because
+      // session.installationId was never populated.
+      const peerCardOut = await cliCapture(peerHome, "card");
+      expect(peerCardOut.code).toBe(0);
+      const peerCard = JSON.parse(peerCardOut.out) as { card: string; installation_id?: string };
+      expect(peerCard.installation_id).toBeTruthy(); // the exact field this task adds
+      expect(peerCard.card.startsWith("am1:")).toBe(true);
+      const peerCardPayload = JSON.parse(Buffer.from(peerCard.card.slice(4), "base64url").toString("utf8"));
+      expect(peerCardPayload.iid).toBeTruthy(); // must be embedded in the wire card, not just the local field
+
+      // Self imports the peer's card via the real `contact add --card` path.
+      expect(await cliAs(selfHome, "contact", "add", "peer", "--card", peerCard.card)).toBe(0);
+
+      const createOut = await cliCapture(selfHome, "context", "create", "--name", "shared doc");
+      expect(createOut.code).toBe(0);
+      const created = JSON.parse(createOut.out) as { context_id: string };
+      expect(created.context_id).toBe("c1");
+
+      expect(await cliAs(selfHome, "context", "set", "--id", "c1", "--text", "hello peer", "--expect", "0")).toBe(0);
+
+      // The guard this task must NOT weaken: this call must actually reach
+      // the server (not refuse with "predates installation identity") now
+      // that the peer's card genuinely carries an installation id.
+      expect(await cliAs(selfHome, "context", "share", "--id", "c1", "--to", "peer")).toBe(0);
+
+      const getOut = await cliCapture(peerHome, "context", "get", "--id", "c1");
+      expect(getOut.code).toBe(0);
+      expect(JSON.parse(getOut.out)).toMatchObject({ context_id: "c1", text: "hello peer" });
+    } finally {
+      rmSync(selfHome, { recursive: true, force: true });
+      rmSync(peerHome, { recursive: true, force: true });
+      await new Promise<void>((r) => e2eServer.close(() => r()));
+    }
   });
 });
 

@@ -26,6 +26,7 @@ export interface RegisterResponse {
   token: string;
   github_login: string;
   github_user_id: string;
+  installation_id: string;
 }
 
 export interface GuestChallengeRequest {

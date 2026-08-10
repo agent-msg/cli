@@ -406,6 +406,7 @@ async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionSto
           privateKey: kp.privateKey,
           identityType: "github",
           verified: true,
+          installationId: r.installation_id,
           installationBoxKey,
         };
         store.save(session);
