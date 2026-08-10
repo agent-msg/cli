@@ -18,6 +18,22 @@ export interface Address {
   // recipient's context code can never open — see R4b. Empty for contacts
   // saved before this field existed, or from a peer whose card predates it.
   installationBoxKey: string;
+  // installationId is the contact's INSTALLATION id (stable across all of
+  // their sessions on that machine) — this is what `addContextMember` must
+  // be given as the recipient. It matches how the server stores
+  // ContextMember.RecipientInstallation and how the recipient's own read
+  // path looks envelopes up (sess.InstallationID). Deliberately distinct
+  // from BOTH sessionId (a session, not the machine) and installationBoxKey
+  // (the sealing key, not the id used to address the envelope): addressing
+  // by session id stores the envelope under a value the recipient's session
+  // never matches, so sealed_key is never returned to them — and the
+  // server's handleListPendingContextKeys treats the member as already
+  // answered the moment ANY envelope exists under that (wrong) key, leaving
+  // the recipient permanently stuck with no recovery path. Empty for
+  // contacts saved before this field existed, or from a peer whose card
+  // predates installation identity — callers must refuse to share rather
+  // than fall back to sessionId (see cli.ts context share).
+  installationId: string;
 }
 
 export interface NamedAddress extends Address {
@@ -56,9 +72,10 @@ export class Contacts {
     } catch {
       throw new Error(`contacts file is corrupt: ${this.file}`);
     }
-    // A contact saved before installationBoxKey existed simply lacks the
-    // field on disk; default it to "" rather than leaving it `undefined`, so
-    // every caller can treat "no box key" uniformly (see the field's doc).
+    // A contact saved before installationBoxKey/installationId existed
+    // simply lacks the field on disk; default each to "" rather than
+    // leaving it `undefined`, so every caller can treat "not known"
+    // uniformly (see each field's doc).
     const out: Record<string, Address> = {};
     for (const [name, a] of Object.entries(parsed)) {
       out[name] = {
@@ -66,6 +83,7 @@ export class Contacts {
         publicKey: a.publicKey || "",
         githubUserId: a.githubUserId || "",
         installationBoxKey: a.installationBoxKey || "",
+        installationId: a.installationId || "",
       };
     }
     return out;
@@ -100,7 +118,7 @@ export class Contacts {
     if (!nameOrSid) return null;
     const saved = this.read()[nameOrSid];
     if (saved) return saved;
-    return { sessionId: nameOrSid, publicKey: "", githubUserId: "", installationBoxKey: "" };
+    return { sessionId: nameOrSid, publicKey: "", githubUserId: "", installationBoxKey: "", installationId: "" };
   }
 
   list(): NamedAddress[] {

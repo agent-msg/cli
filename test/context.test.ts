@@ -336,9 +336,14 @@ describe("agentmsg context", () => {
     const aliceSeed = Buffer.alloc(32, 0x99);
     const aliceBoxKeys = installationBoxKeys(aliceSeed);
     const aliceSessionKeys = await generateKeypair(); // her unrelated messaging keypair
+    // Deliberately give session id and installation id DIFFERENT values —
+    // exactly the R4b/R7 bug: the CLI once addressed the envelope by
+    // session id. If the fix regresses to that, the request-level
+    // assertion below (recipient_installation) catches it even though
+    // sealing itself would still "work" (both are just strings to seal()).
     new Contacts(home).add("alice", {
       sessionId: "s-alice", publicKey: aliceSessionKeys.publicKey, githubUserId: "7",
-      installationBoxKey: aliceBoxKeys.publicKey,
+      installationBoxKey: aliceBoxKeys.publicKey, installationId: "install-alice",
     });
 
     const code = await cli("context", "share", "--id", "c1", "--to", "alice");
@@ -346,6 +351,13 @@ describe("agentmsg context", () => {
 
     expect(addedMembers).toHaveLength(1);
     expect(addedMembers[0].github_user_id).toBe("7");
+    // The critical assertion: what the SERVER actually received as
+    // recipient_installation must be alice's installation id, and must NOT
+    // be her session id. A test that only checked the sealed_key contents
+    // (as before) could pass even with the session-id mis-addressing bug,
+    // because seal() doesn't care what string it's given.
+    expect(addedMembers[0].recipient_installation).toBe("install-alice");
+    expect(addedMembers[0].recipient_installation).not.toBe("s-alice");
     // The envelope is genuinely usable on Alice's machine: her installation
     // box private key (derived independently, from HER seed) opens it.
     const opened = await open(addedMembers[0].sealed_key, aliceBoxKeys.publicKey, aliceBoxKeys.privateKey);
@@ -363,7 +375,7 @@ describe("agentmsg context", () => {
     // A contact saved before R4b has no installationBoxKey on disk.
     new Contacts(home).add("alice", {
       sessionId: "s-alice", publicKey: (await generateKeypair()).publicKey, githubUserId: "7",
-      installationBoxKey: "",
+      installationBoxKey: "", installationId: "",
     });
 
     const errs: string[] = [];
@@ -373,6 +385,33 @@ describe("agentmsg context", () => {
 
     expect(code).toBe(1);
     expect(errs.join("")).toMatch(/predates installation keys/i);
+    expect(addedMembers).toHaveLength(0);
+  });
+
+  // Backward compatibility, the exact scenario this task exists to close: a
+  // contact saved (or a card pasted) before installation identity existed
+  // has an installationBoxKey (from the earlier R4b fix) but no
+  // installationId. Sharing must refuse with a clear, actionable message —
+  // never silently fall back to sessionId and send a mis-addressed
+  // envelope the recipient can never recover from.
+  it("share refuses with a clear message when the contact has a box key but no installation id", async () => {
+    expect(await cli("register", "--dev-user", "9", "--allow-insecure-http")).toBe(0);
+    await cli("context", "create", "--name", "n");
+    const aliceBoxKeys = installationBoxKeys(Buffer.alloc(32, 0x99));
+    new Contacts(home).add("alice", {
+      sessionId: "s-alice", publicKey: (await generateKeypair()).publicKey, githubUserId: "7",
+      installationBoxKey: aliceBoxKeys.publicKey, installationId: "",
+    });
+
+    const errs: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((c: any) => (errs.push(String(c)), true));
+    const code = await cli("context", "share", "--id", "c1", "--to", "alice");
+    spy.mockRestore();
+
+    expect(code).toBe(1);
+    expect(errs.join("")).toMatch(/predates installation identity/i);
+    // No request must have gone out at all — a silent wrong-address is
+    // exactly the failure this task exists to remove.
     expect(addedMembers).toHaveLength(0);
   });
 

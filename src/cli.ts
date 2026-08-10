@@ -34,7 +34,7 @@ Usage:
   agentmsg register [--name NAME] [--verified] [--profile NAME] Guest first
   agentmsg whoami                                       show your address card
   agentmsg card [--qr]                                  print a compact address card
-  agentmsg contact add NAME --sid SID --pubkey PK [--user ID] [--installation-box-key KEY]
+  agentmsg contact add NAME --sid SID --pubkey PK [--user ID] [--installation-box-key KEY] [--installation-id ID]
   agentmsg contact list
   agentmsg policy set --mode MODE [--allow a,b] [--i-understand-the-risk]
   agentmsg send --to NAME|SID --text TEXT [--file PATH] encrypts; --file attaches (Pro, E2EE)
@@ -109,7 +109,8 @@ function emit(obj: unknown): void {
 
 function compactCard(s: Session): string {
   const payload = { v: 1, name: s.nickname || undefined, sid: s.sessionId, pk: s.publicKey,
-    uid: s.githubUserId || undefined, exp: s.expiresAt || undefined, ibk: s.installationBoxKey || undefined };
+    uid: s.githubUserId || undefined, exp: s.expiresAt || undefined, ibk: s.installationBoxKey || undefined,
+    iid: s.installationId || undefined };
   return `am1:${Buffer.from(JSON.stringify(payload)).toString("base64url")}`;
 }
 function note(msg: string): void {
@@ -191,6 +192,7 @@ function noteAddressCard(s: Session): void {
   note("Address card (share only over a trusted channel):");
   note(`  session_id: ${s.sessionId}`);
   note(`  public_key: ${s.publicKey}`);
+  if (s.installationId) note(`  installation_id: ${s.installationId}`);
   if (s.installationBoxKey) note(`  installation_box_key: ${s.installationBoxKey}`);
   if (s.githubUserId) note(`  github_user_id: ${s.githubUserId}`);
   if (s.expiresAt) note(`  expires_at: ${s.expiresAt}`);
@@ -224,6 +226,7 @@ export async function run(argv: string[]): Promise<number> {
         emit({
           card: compactCard(s), nickname: s.nickname || undefined, session_id: s.sessionId,
           public_key: s.publicKey, installation_box_key: s.installationBoxKey,
+          installation_id: s.installationId,
         });
         return 0;
       }
@@ -434,13 +437,16 @@ function cmdContact(args: ReturnType<typeof parseArgs>, contacts: Contacts): num
       if (!compact.startsWith("am1:")) { note("error: invalid address card prefix"); return 2; }
       try {
         const p = JSON.parse(Buffer.from(compact.slice(4), "base64url").toString("utf8")) as
-          { sid?: string; pk?: string; uid?: string; ibk?: string };
+          { sid?: string; pk?: string; uid?: string; ibk?: string; iid?: string };
         if (!p.sid || !p.pk) throw new Error("missing sid or public key");
         const name = args._[1];
         if (!name) { note("usage: agentmsg contact add NAME --card CARD [--force]"); return 2; }
         contacts.add(
           name,
-          { sessionId: p.sid, publicKey: p.pk, githubUserId: p.uid || "", installationBoxKey: p.ibk || "" },
+          {
+            sessionId: p.sid, publicKey: p.pk, githubUserId: p.uid || "",
+            installationBoxKey: p.ibk || "", installationId: p.iid || "",
+          },
           args.flags.force === true,
         );
         emit({ status: "contact_saved", name, fingerprint: fingerprint(p.pk) });
@@ -449,7 +455,7 @@ function cmdContact(args: ReturnType<typeof parseArgs>, contacts: Contacts): num
     }
     const name = args._[1];
     if (!name || !args.flags.sid || !args.flags.pubkey) {
-      note("usage: agentmsg contact add NAME --sid SID --pubkey PK [--user ID] [--installation-box-key KEY] [--force]");
+      note("usage: agentmsg contact add NAME --sid SID --pubkey PK [--user ID] [--installation-box-key KEY] [--installation-id ID] [--force]");
       return 2;
     }
     const pubkey = String(args.flags.pubkey);
@@ -459,6 +465,7 @@ function cmdContact(args: ReturnType<typeof parseArgs>, contacts: Contacts): num
         sessionId: String(args.flags.sid), publicKey: pubkey,
         githubUserId: String(args.flags.user || ""),
         installationBoxKey: String(args.flags["installation-box-key"] || ""),
+        installationId: String(args.flags["installation-id"] || ""),
       },
       args.flags.force === true,
     );
@@ -1004,17 +1011,24 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
       note(`   then: agentmsg contact add ${to} --sid <sid> --pubkey <pubkey> --user <id> --installation-box-key <key> --force`);
       return 1;
     }
-    // KNOWN LIMITATION: envelopes are supposed to be keyed by the recipient's
-    // INSTALLATION id (stable across their sessions), not a session id — see
-    // rework-plan.md Task R2. Contacts only records a session id today
-    // (contact add --sid), so this still addresses the envelope by session
-    // id. It works when that is also the id the recipient's server-side
-    // membership row was created with, but does not yet deliver the
-    // cross-session guarantee the rest of this rework provides. Fixing it
-    // needs contacts.ts (and the compact-card format) to carry the peer's
-    // installation id too, which is out of R4's scope — flagged for a
-    // follow-up rather than silently left inconsistent.
-    await client.addContextMember(id, addr.githubUserId, role, addr.sessionId, await seal(key, addr.installationBoxKey));
+    // Envelopes MUST be addressed by the recipient's INSTALLATION id (stable
+    // across their sessions), never a session id: the server stores this
+    // value verbatim as ContextMember.RecipientInstallation, and the
+    // recipient's read path looks envelopes up by their real
+    // sess.InstallationID. Addressing by session id means the two never
+    // match, so sealed_key is never returned to them — and because the
+    // server treats a member as "already answered" once ANY envelope exists
+    // under their stored value, the recipient is then permanently stuck
+    // with no recovery path. A contact saved (or a card pasted) before
+    // installation identity existed has no installationId: refuse here,
+    // clearly, rather than silently falling back to sessionId.
+    if (!addr.installationId) {
+      note(`error: this contact's card predates installation identity; ask them to re-share their card.`);
+      note(`   They should re-run 'agentmsg whoami' or 'agentmsg card' and re-send you their card,`);
+      note(`   then: agentmsg contact add ${to} --sid <sid> --pubkey <pubkey> --user <id> --installation-box-key <key> --installation-id <id> --force`);
+      return 1;
+    }
+    await client.addContextMember(id, addr.githubUserId, role, addr.installationId, await seal(key, addr.installationBoxKey));
     emit({ status: "shared", context_id: id, with: to, role });
     return 0;
   }
