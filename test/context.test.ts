@@ -342,7 +342,7 @@ describe("agentmsg context", () => {
     const bobSessionKeys = await generateKeypair();
     new Contacts(home).add("bob", {
       sessionId: "s-bob", publicKey: bobSessionKeys.publicKey, githubUserId: "42",
-      installationBoxKey: bobBoxKeys.publicKey,
+      installationBoxKey: bobBoxKeys.publicKey, installationId: "install-bob",
     });
     pendingList = [{ context_id: "c1", epoch: 1, github_user_id: "42", role: "writer", recipient_installation: "install-bob" }];
 
@@ -362,6 +362,70 @@ describe("agentmsg context", () => {
     // Negative pin: bob's SESSION messaging key must NOT be able to open it
     // — sealing to the wrong key type must fail, not silently "work".
     await expect(open(envelope.sealed_key, bobSessionKeys.publicKey, bobSessionKeys.privateKey)).rejects.toThrow();
+  });
+
+  // R9: piggyback answering must match a candidate contact on BOTH
+  // githubUserId AND installationId, not githubUserId alone. Bob re-registers
+  // (or switches machines) and re-shares his card with the owner, but this
+  // keyholder's cached contact for him is still the OLD installation. If we
+  // seal with the stale contact's installationBoxKey, the envelope goes up
+  // addressed to Bob's NEW recipient_installation but is only openable by his
+  // OLD installation's private key — Bob can never open it, and because the
+  // server refuses to overwrite an existing envelope for that
+  // (context, epoch, recipient_installation) slot, he is then permanently
+  // locked out with no recovery path. The fix must skip a githubUserId match
+  // whose installationId disagrees with the pending entry's
+  // recipient_installation, leaving it pending for a keyholder with a
+  // current card to answer instead.
+  it("does not seal with a stale installation's box key when the recipient has moved to a new installation", async () => {
+    expect(await cli("register", "--dev-user", "9", "--allow-insecure-http")).toBe(0);
+    await cli("context", "create", "--name", "n"); // we now hold c1's key locally
+
+    // Bob's OLD installation (the one this keyholder's cached contact still
+    // points to) and his NEW installation (the one the server is actually
+    // addressing the pending envelope to, after he re-registered elsewhere).
+    const bobOldSeed = Buffer.alloc(32, 0x11);
+    const bobOldBoxKeys = installationBoxKeys(bobOldSeed);
+    const bobNewSeed = Buffer.alloc(32, 0x22);
+    const bobNewBoxKeys = installationBoxKeys(bobNewSeed);
+
+    new Contacts(home).add("bob", {
+      sessionId: "s-bob-old", publicKey: (await generateKeypair()).publicKey, githubUserId: "42",
+      installationBoxKey: bobOldBoxKeys.publicKey, installationId: "install-bob-old",
+    });
+    pendingList = [{ context_id: "c1", epoch: 1, github_user_id: "42", role: "writer", recipient_installation: "install-bob-new" }];
+
+    const code = await cli("context", "list");
+    expect(code).toBe(0);
+
+    // The critical assertion: nothing gets uploaded. Sealing with the stale
+    // contact's box key and addressing it to "install-bob-new" would produce
+    // an envelope Bob can never open, and would permanently burn that slot.
+    expect(uploadedEnvelopes).toHaveLength(0);
+
+    // Recovery: once a keyholder has Bob's CURRENT card (matching both
+    // githubUserId and his new installationId), the same pending entry must
+    // still be answerable — Bob is not permanently locked out.
+    new Contacts(home).add(
+      "bob",
+      {
+        sessionId: "s-bob-new", publicKey: (await generateKeypair()).publicKey, githubUserId: "42",
+        installationBoxKey: bobNewBoxKeys.publicKey, installationId: "install-bob-new",
+      },
+      true,
+    );
+
+    const code2 = await cli("context", "list");
+    expect(code2).toBe(0);
+
+    expect(uploadedEnvelopes).toHaveLength(1);
+    expect(uploadedEnvelopes[0].envelopes).toHaveLength(1);
+    const envelope = uploadedEnvelopes[0].envelopes[0];
+    expect(envelope.recipient_installation).toBe("install-bob-new");
+    const opened = await open(envelope.sealed_key, bobNewBoxKeys.publicKey, bobNewBoxKeys.privateKey);
+    expect(opened).toBe(new ContextKeys(home).get("c1"));
+    // Negative pin: Bob's OLD installation private key must NOT open it.
+    await expect(open(envelope.sealed_key, bobOldBoxKeys.publicKey, bobOldBoxKeys.privateKey)).rejects.toThrow();
   });
 
   // R4b: 'share' must seal to the recipient's INSTALLATION box key, derived

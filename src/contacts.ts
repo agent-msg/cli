@@ -5,11 +5,12 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { defaultHome } from "./session.js";
+import { InstallationId, SessionId, GitHubUserId, asInstallationId, asSessionId, asGitHubUserId } from "./ids.js";
 
 export interface Address {
-  sessionId: string;
+  sessionId: SessionId;
   publicKey: string;
-  githubUserId: string;
+  githubUserId: GitHubUserId;
   // installationBoxKey is the contact's installation-derived X25519 public
   // key (see installation-box.ts) — the key shared-context envelopes must be
   // sealed to. Deliberately kept separate from publicKey (that contact's
@@ -33,7 +34,7 @@ export interface Address {
   // contacts saved before this field existed, or from a peer whose card
   // predates installation identity — callers must refuse to share rather
   // than fall back to sessionId (see cli.ts context share).
-  installationId: string;
+  installationId: InstallationId;
 }
 
 export interface NamedAddress extends Address {
@@ -79,11 +80,11 @@ export class Contacts {
     const out: Record<string, Address> = {};
     for (const [name, a] of Object.entries(parsed)) {
       out[name] = {
-        sessionId: a.sessionId || "",
+        sessionId: asSessionId(a.sessionId || ""),
         publicKey: a.publicKey || "",
-        githubUserId: a.githubUserId || "",
+        githubUserId: asGitHubUserId(a.githubUserId || ""),
         installationBoxKey: a.installationBoxKey || "",
-        installationId: a.installationId || "",
+        installationId: asInstallationId(a.installationId || ""),
       };
     }
     return out;
@@ -118,7 +119,10 @@ export class Contacts {
     if (!nameOrSid) return null;
     const saved = this.read()[nameOrSid];
     if (saved) return saved;
-    return { sessionId: nameOrSid, publicKey: "", githubUserId: "", installationBoxKey: "", installationId: "" };
+    return {
+      sessionId: asSessionId(nameOrSid), publicKey: "",
+      githubUserId: asGitHubUserId(""), installationBoxKey: "", installationId: asInstallationId(""),
+    };
   }
 
   list(): NamedAddress[] {

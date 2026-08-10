@@ -22,6 +22,7 @@ import { InstallationStore } from "./installation.js";
 import { installationBoxKeys, InstallationBoxKeys } from "./installation-box.js";
 import { CLI_VERSION, registerGuestFirst } from "./guest.js";
 import { ContextKeys } from "./context.js";
+import { InstallationId, asInstallationId, asSessionId, asGitHubUserId } from "./ids.js";
 import { encodeRecoveryCode, decodeRecoveryCode } from "./recovery.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
@@ -471,8 +472,8 @@ function cmdContact(args: ReturnType<typeof parseArgs>, contacts: Contacts): num
         contacts.add(
           name,
           {
-            sessionId: p.sid, publicKey: p.pk, githubUserId: p.uid || "",
-            installationBoxKey: p.ibk || "", installationId: p.iid || "",
+            sessionId: asSessionId(p.sid), publicKey: p.pk, githubUserId: asGitHubUserId(p.uid || ""),
+            installationBoxKey: p.ibk || "", installationId: asInstallationId(p.iid || ""),
           },
           args.flags.force === true,
         );
@@ -489,10 +490,10 @@ function cmdContact(args: ReturnType<typeof parseArgs>, contacts: Contacts): num
     contacts.add(
       name,
       {
-        sessionId: String(args.flags.sid), publicKey: pubkey,
-        githubUserId: String(args.flags.user || ""),
+        sessionId: asSessionId(String(args.flags.sid)), publicKey: pubkey,
+        githubUserId: asGitHubUserId(String(args.flags.user || "")),
         installationBoxKey: String(args.flags["installation-box-key"] || ""),
-        installationId: String(args.flags["installation-id"] || ""),
+        installationId: asInstallationId(String(args.flags["installation-id"] || "")),
       },
       args.flags.force === true,
     );
@@ -843,7 +844,7 @@ async function answerPendingContextKeys(
   client: Client,
   keys: ContextKeys,
   contacts: Contacts,
-  selfInstallationId?: string,
+  selfInstallationId?: InstallationId,
 ): Promise<void> {
   try {
     const pending = await client.pendingContextKeys();
@@ -855,7 +856,23 @@ async function answerPendingContextKeys(
       if (selfInstallationId && p.recipient_installation === selfInstallationId) continue;
       const key = keys.get(p.context_id);
       if (!key) continue; // we can't answer for a context we hold no key for
-      const contact = book.find((c) => c.githubUserId && c.githubUserId === p.github_user_id);
+      // Match on githubUserId AND installationId, never githubUserId alone.
+      // A member can re-register (or switch machines) and re-share their
+      // card with the owner without every other keyholder's cached contact
+      // catching up — that keyholder's book then still has the member's OLD
+      // installationId under the same githubUserId. Sealing with that stale
+      // contact's installationBoxKey would produce an envelope addressed to
+      // the member's CURRENT recipient_installation but only openable by
+      // their OLD installation's private key: unopenable, and because the
+      // server refuses to overwrite an existing envelope for that
+      // (context, epoch, recipient_installation) slot, permanently so — the
+      // member is silently and permanently locked out (see R9). Treat any
+      // entry with no fully-current contact as unanswerable and leave it
+      // pending, rather than ever seal with a key from a different
+      // installation.
+      const contact = book.find(
+        (c) => c.githubUserId && c.githubUserId === p.github_user_id && c.installationId === p.recipient_installation,
+      );
       // Seal to their INSTALLATION box key, not contact.publicKey (their
       // session's ephemeral messaging keypair) — sealing to the wrong key
       // produces an envelope their resolveContextKey() can never open. A
@@ -895,8 +912,9 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
   // server for our own current address card, which always has it. This is
   // needed both to skip ourselves in the pending list below and to
   // self-address the envelope during a real key rotation on revoke.
-  const selfInstallationId =
+  const selfInstallationIdRaw =
     s.installationId || (await client.addressCard().then((c) => c.installation_id).catch(() => undefined));
+  const selfInstallationId = selfInstallationIdRaw ? asInstallationId(selfInstallationIdRaw) : undefined;
 
   // Any context command answers what pending authorisations it can, in
   // passing — no daemon, no separate command.
@@ -1066,7 +1084,7 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
 
   if (sub === "revoke") {
     const id = String(args.flags.id || "");
-    const uid = String(args.flags.user || "");
+    const uid = asGitHubUserId(String(args.flags.user || ""));
     if (!id || !uid) {
       note("usage: agentmsg context revoke --id ID --user GITHUB_USER_ID");
       return 2;

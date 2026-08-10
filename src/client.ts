@@ -2,6 +2,8 @@
 // the CLI layer seals/opens message bodies around these calls. Mirrors the Go
 // client's endpoints and error envelope.
 
+import { InstallationId, GitHubUserId } from "./ids.js";
+
 export interface ApiErrorBody {
   error: string;
   message?: string;
@@ -202,15 +204,15 @@ export interface PutContextResponse {
 export interface PendingKeyDTO {
   context_id: string;
   epoch: number;
-  github_user_id: string;
+  github_user_id: GitHubUserId;
   role: string;
-  recipient_installation: string;
+  recipient_installation: InstallationId;
 }
 
 /** One sealed-key envelope, addressed to the recipient's installation id
  *  (never a session id — see the R2/R3 rework). */
 export interface KeyEnvelope {
-  recipient_installation: string;
+  recipient_installation: InstallationId;
   sealed_key: string;
 }
 
@@ -606,13 +608,13 @@ export class Client {
   // — envelopes bind to installation (see rework-plan.md Task R2). An older
   // brief called this field recipient_session; that name is stale and the
   // server no longer recognizes it.
-  addContextMember(id: string, githubUserID: string, role: string, recipientInstallation: string, sealedKey: string): Promise<unknown> {
+  addContextMember(id: string, githubUserID: GitHubUserId, role: string, recipientInstallation: InstallationId, sealedKey: string): Promise<unknown> {
     return this.call("POST", `/v1/contexts/${encodeURIComponent(id)}/members`, {
       github_user_id: githubUserID, role, recipient_installation: recipientInstallation, sealed_key: sealedKey,
     });
   }
 
-  removeContextMember(id: string, githubUserID: string): Promise<ContextDTO> {
+  removeContextMember(id: string, githubUserID: GitHubUserId): Promise<ContextDTO> {
     return this.call("DELETE", `/v1/contexts/${encodeURIComponent(id)}/members/${encodeURIComponent(githubUserID)}`);
   }
 
