@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, statSync, mkdirSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { closeServer } from "./setup.js";
 import { join } from "node:path";
 import { ContextKeys } from "../src/context.js";
 import { decryptSym, encryptSym, seal, open, generateContextKey, generateKeypair } from "../src/crypto.js";
@@ -214,7 +215,7 @@ beforeEach(async () => {
   const a = server.address();
   base = `http://127.0.0.1:${typeof a === "object" && a ? a.port : 0}`;
 });
-afterEach(() => new Promise<void>((r) => server.close(() => r())));
+afterEach(() => closeServer(server));
 
 async function cli(...argv: string[]) {
   process.env.AGENTMSG_HOME = home;
@@ -1176,7 +1177,7 @@ describe("end-to-end sharing between two real registrations (no fabricated ident
     } finally {
       rmSync(selfHome, { recursive: true, force: true });
       rmSync(peerHome, { recursive: true, force: true });
-      await new Promise<void>((r) => e2eServer.close(() => r()));
+      await closeServer(e2eServer);
     }
   });
 });
@@ -1199,7 +1200,17 @@ describe("ContextKeys", () => {
 
   // The file holds decryption keys for shared documents; group- or
   // world-readable would expose every context on a shared machine.
-  it("stores keys with owner-only permissions", () => {
+  //
+  // Windows has no Unix permission bits: fs.chmod there is largely a no-op
+  // and statSync().mode does not reflect an owner-only ACL, so `& 0o077`
+  // can't be asserted (CI saw `54` — 0o066 — instead of 0). The equivalent
+  // property on Windows is enforced at the directory level: ensureSecureHome
+  // (src/installation.ts) restricts AGENTMSG_HOME to the current user via
+  // icacls before any file is written into it, which atomicWritePrivate()
+  // always calls first. See test/installation.test.ts and
+  // AGENTMSG_TEST_SKIP_WINDOWS_ACL for the precedent of skipping the
+  // mode-bit assertion rather than dropping the property.
+  it.skipIf(process.platform === "win32")("stores keys with owner-only permissions", () => {
     const k = new ContextKeys(home);
     k.save("ctx1", "key1");
     expect(statSync(join(home, "contexts.json")).mode & 0o077).toBe(0);
@@ -1231,7 +1242,10 @@ describe("ContextKeys", () => {
   // Enforces the mode even when contexts.json already existed with looser
   // permissions before save() ran — writeFileSync/atomicWritePrivate must not
   // silently inherit stale permissions from a pre-existing file.
-  it("tightens permissions on a pre-existing, loosely-permissioned file", () => {
+  //
+  // Skipped on Windows for the same reason as the test above: chmodSync(file,
+  // 0o644) and the `& 0o077` assertion are both meaningless there.
+  it.skipIf(process.platform === "win32")("tightens permissions on a pre-existing, loosely-permissioned file", () => {
     mkdirSync(home, { recursive: true });
     const file = join(home, "contexts.json");
     writeFileSync(file, JSON.stringify({ keys: {} }));

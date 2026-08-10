@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createServer, Server } from "node:http";
+import { closeServer } from "./setup.js";
 import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
@@ -131,7 +132,7 @@ beforeEach(async () => {
   const a = server.address();
   base = `http://127.0.0.1:${typeof a === "object" && a ? a.port : 0}`;
 });
-afterEach(() => new Promise<void>((r) => server.close(() => r())));
+afterEach(() => closeServer(server));
 
 let home: string;
 beforeEach(() => (home = mkdtempSync(join(tmpdir(), "amsg-reg-"))));

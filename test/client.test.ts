@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import { createServer, Server, IncomingMessage, ServerResponse } from "node:http";
+import { closeServer } from "./setup.js";
 import { Client, ApiError, VersionConflict } from "../src/client.js";
 
 // A tiny stub server that records requests and replies from a scripted table.
@@ -33,7 +34,7 @@ beforeAll(async () => {
   const addr = server.address();
   base = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}`;
 });
-afterAll(() => new Promise<void>((r) => server.close(() => r())));
+afterAll(() => closeServer(server));
 
 describe("Client", () => {
   it("register posts the credential and returns the card", async () => {

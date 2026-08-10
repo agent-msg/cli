@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { run } from "../src/cli.js";
+import { closeServer } from "./setup.js";
 
 // Stub inbox server: /v1/inbox?after=N returns plaintext messages with seq > N
 // plus the ack cursor; /v1/inbox/ack advances that cursor. The `inbox` array and
@@ -55,14 +56,11 @@ beforeEach(async () => {
   const a = server.address();
   base = `http://127.0.0.1:${typeof a === "object" && a ? a.port : 0}`;
 });
-afterEach(
-  () =>
-    new Promise<void>((r) => {
-      for (const c of streamClients) c.res.end();
-      streamClients = [];
-      server.close(() => r());
-    }),
-);
+afterEach(async () => {
+  for (const c of streamClients) c.res.end();
+  streamClients = [];
+  await closeServer(server);
+});
 
 let home: string;
 beforeEach(() => (home = mkdtempSync(join(tmpdir(), "amsg-rcv-"))));

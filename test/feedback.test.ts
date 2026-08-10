@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createServer, Server } from "node:http";
+import { closeServer } from "./setup.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -35,7 +36,7 @@ beforeEach(async () => {
   home = mkdtempSync(join(tmpdir(), "amsg-fb-"));
 });
 afterEach(async () => {
-  await new Promise<void>((r) => server.close(() => r()));
+  await closeServer(server);
   rmSync(home, { recursive: true, force: true });
 });
 

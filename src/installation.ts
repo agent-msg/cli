@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign } from "node:crypto";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
 const PKCS8_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
@@ -72,7 +72,30 @@ function ensureSecureHome(home: string): void {
   } else {
     mkdirSync(home, { recursive: true, mode: 0o700 });
   }
-  if (process.platform === "win32") hardenWindowsDirectory(home);
+  if (process.platform === "win32") hardenWindowsDirectoryOnce(home);
+}
+
+// hardenWindowsDirectory spawns two synchronous child processes (whoami.exe,
+// then icacls.exe). ensureSecureHome() above runs on every single call to
+// atomicWritePrivate(), and one CLI invocation can write several private
+// files (installation key, installation meta, session token, contexts
+// store, ...) — each triggering its own pair of blocking spawns. On GitHub's
+// Windows runners those two process spawns alone routinely cost more than a
+// second; a handful of writes in one command is enough to blow past a 5s
+// test timeout before any network I/O even happens. This is what was making
+// `context.test.ts` slow/hang specifically on Windows.
+//
+// Nothing in this codebase loosens an AGENTMSG_HOME directory's ACL once
+// set, so re-hardening the same directory on every write is redundant, not
+// merely cautious: cache which directories this process has already
+// restricted and skip the repeat spawns. Keyed by resolved, lower-cased path
+// since Windows filesystem paths are case-insensitive.
+const hardenedWindowsDirs = new Set<string>();
+function hardenWindowsDirectoryOnce(path: string): void {
+  const key = resolve(path).toLowerCase();
+  if (hardenedWindowsDirs.has(key)) return;
+  hardenWindowsDirectory(path);
+  hardenedWindowsDirs.add(key);
 }
 
 function hardenWindowsDirectory(path: string): void {

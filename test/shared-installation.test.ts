@@ -8,6 +8,7 @@
 // must live in the base home, while session state stays isolated per session.
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createServer, Server } from "node:http";
+import { closeServer } from "./setup.js";
 import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -118,7 +119,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  await new Promise<void>((r) => server.close(() => r()));
+  await closeServer(server);
   rmSync(base, { recursive: true, force: true });
   for (const k of TOUCHED) {
     if (savedEnv[k] === undefined) delete process.env[k];
