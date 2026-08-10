@@ -118,7 +118,7 @@ describe("Client", () => {
   it("commitContext raises a typed VersionConflict carrying the server's current_version", async () => {
     reply = { status: 409, body: { error: "version_conflict", current_version: 7 } };
     const c = new Client(base, "tok");
-    const err = await c.commitContext("ctx1", 3, 100, "deadbeef").catch((e) => e);
+    const err = await c.commitContext("ctx1", 3, 100, "deadbeef", "contexts/quarantine/ctx1/0/abc").catch((e) => e);
     expect(err).toBeInstanceOf(VersionConflict);
     expect((err as VersionConflict).currentVersion).toBe(7);
   });
@@ -131,7 +131,7 @@ describe("Client", () => {
     // visible error. The fix must instead surface a failure.
     reply = { status: 409, body: { error: "version_conflict" } };
     const c = new Client(base, "tok");
-    const err = await c.commitContext("ctx1", 3, 100, "deadbeef").catch((e) => e);
+    const err = await c.commitContext("ctx1", 3, 100, "deadbeef", "contexts/quarantine/ctx1/0/abc").catch((e) => e);
     expect(err).not.toBeInstanceOf(VersionConflict);
     expect(err).toBeInstanceOf(ApiError);
     expect((err as ApiError).status).toBe(409);

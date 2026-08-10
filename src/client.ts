@@ -606,10 +606,10 @@ export class Client {
    *  anywhere. Instead the original ApiError is rethrown so the failure is
    *  visible.
    */
-  async commitContext(id: string, expectedVersion: number, bytes: number, sha256: string): Promise<ContextDTO> {
+  async commitContext(id: string, expectedVersion: number, bytes: number, sha256: string, blobKey: string): Promise<ContextDTO> {
     try {
       return await this.call<ContextDTO>("POST", `/v1/contexts/${encodeURIComponent(id)}/commit`, {
-        expected_version: expectedVersion, bytes, sha256,
+        expected_version: expectedVersion, bytes, sha256, blob_key: blobKey,
       });
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {

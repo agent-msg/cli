@@ -1034,7 +1034,7 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
     try {
       const ticket = await client.putContext(id, expect, ct.length, sha256);
       await client.uploadPut(ticket.upload_url, ct, "application/octet-stream");
-      const done = await client.commitContext(id, expect, ct.length, sha256);
+      const done = await client.commitContext(id, expect, ct.length, sha256, ticket.blob_key);
       emit({ context_id: id, version: done.version });
       return 0;
     } catch (e) {
@@ -1146,7 +1146,7 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
           const sha256 = createHash("sha256").update(newCt).digest("hex");
           const ticket = await client.putContext(id, full.version, newCt.length, sha256);
           await client.uploadPut(ticket.upload_url, newCt, "application/octet-stream");
-          await client.commitContext(id, full.version, newCt.length, sha256);
+          await client.commitContext(id, full.version, newCt.length, sha256, ticket.blob_key);
         }
         // Deliver the fresh key to OURSELVES too: the server trusts the
         // owner unconditionally for this (see handleRotateKeys), and doing
