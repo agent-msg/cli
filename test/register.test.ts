@@ -15,7 +15,12 @@ describe("defaultHome + profiles", () => {
     delete process.env.CLAUDE_CODE_SESSION_ID;
   });
   afterEach(() => {
-    process.env.AGENTMSG_HOME = savedHome;
+    // `process.env.X = undefined` sets X to the literal string "undefined"
+    // rather than deleting it (a real Node.js footgun) — guard it exactly
+    // like the two lines below already do, so a home-less starting state
+    // doesn't leak a bogus "undefined" AGENTMSG_HOME into later tests.
+    if (savedHome === undefined) delete process.env.AGENTMSG_HOME;
+    else process.env.AGENTMSG_HOME = savedHome;
     if (savedProfile === undefined) delete process.env.AGENTMSG_PROFILE;
     else process.env.AGENTMSG_PROFILE = savedProfile;
     if (savedAgent === undefined) delete process.env.CLAUDE_CODE_SESSION_ID;

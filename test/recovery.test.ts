@@ -34,8 +34,19 @@ describe("recovery code", () => {
   it("rejects a mistyped code with a clear error, not a raw exception", async () => {
     const key = await generateContextKey();
     const code = encodeRecoveryCode(key);
-    // Flip one character near the end (still valid alphabet, wrong value).
-    const flipped = code.slice(0, -1) + (code.at(-1) === "0" ? "1" : "0");
+    // Flip the SECOND-to-last symbol, not the last one. generateContextKey()
+    // is always crypto_secretbox_KEYBYTES (32 bytes); with the 2-byte
+    // checksum that's a fixed 272-bit payload, which base32-encodes to 55
+    // symbols where the final symbol carries only the checksum's last 2 real
+    // bits plus 3 zero PADDING bits (base32Decode drops them — see
+    // recovery.ts). Flipping "0"->"1" in that last symbol can toggle only a
+    // padding bit, silently producing a still-valid code ~1/4 of the time
+    // (this was flaky: `npx vitest run test/recovery.test.ts` alone always
+    // passed, but the full suite failed here roughly 1 run in 4). The
+    // second-to-last symbol sits entirely inside the checksum's real bits, so
+    // flipping it always changes the transmitted checksum deterministically.
+    const idx = code.length - 2;
+    const flipped = code.slice(0, idx) + (code[idx] === "0" ? "1" : "0") + code.slice(idx + 1);
     expect(() => decodeRecoveryCode(flipped)).toThrow(/checksum|mismatch|invalid/i);
   });
 

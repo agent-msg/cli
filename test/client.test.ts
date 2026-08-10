@@ -147,8 +147,11 @@ describe("Client hardening (HARD-01)", () => {
     const orig = globalThis.fetch;
     globalThis.fetch = async () =>
       new Response("{}", { status: 200, headers: { "content-length": String(64 * 1024 * 1024) } });
-    await expect(big.inboxPage(0)).rejects.toMatchObject({ code: "response_too_large" });
-    globalThis.fetch = orig;
+    try {
+      await expect(big.inboxPage(0)).rejects.toMatchObject({ code: "response_too_large" });
+    } finally {
+      globalThis.fetch = orig;
+    }
   });
 
   it("rejects a URL that would send credentials to a remote http origin", () => {
