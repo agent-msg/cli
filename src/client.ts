@@ -609,11 +609,21 @@ export class Client {
    *  anywhere. Instead the original ApiError is rethrown so the failure is
    *  visible.
    */
-  async commitContext(id: string, expectedVersion: number, bytes: number, sha256: string, blobKey: string): Promise<ContextDTO> {
+  //  nameEnc, when supplied, replaces the context's encrypted name atomically
+  //  with the body under this same CAS (see shared.PutContextRequest.NameEnc
+  //  on the server). It is the rotation path: `context revoke` decrypts the
+  //  name with the OLD key and re-encrypts it with the fresh one, then sends
+  //  it here alongside the re-encrypted body, so a removed member who kept
+  //  the old key can never decrypt a name left behind under the new epoch.
+  //  undefined means "not supplied" and must be OMITTED from the request
+  //  body entirely (not sent as null/""), matching the server's *string
+  //  distinction between "absent" and "set to empty" — an ordinary
+  //  content-only commit must never risk blanking the stored name.
+  async commitContext(id: string, expectedVersion: number, bytes: number, sha256: string, blobKey: string, nameEnc?: string): Promise<ContextDTO> {
     try {
-      return await this.call<ContextDTO>("POST", `/v1/contexts/${encodeURIComponent(id)}/commit`, {
-        expected_version: expectedVersion, bytes, sha256, blob_key: blobKey,
-      });
+      const body: Record<string, unknown> = { expected_version: expectedVersion, bytes, sha256, blob_key: blobKey };
+      if (nameEnc !== undefined) body.name_enc = nameEnc;
+      return await this.call<ContextDTO>("POST", `/v1/contexts/${encodeURIComponent(id)}/commit`, body);
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
         const cv = e.details.current_version;

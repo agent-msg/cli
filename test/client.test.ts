@@ -124,6 +124,20 @@ describe("Client", () => {
     expect((err as VersionConflict).currentVersion).toBe(7);
   });
 
+  it("commitContext includes name_enc in the request body when supplied", async () => {
+    reply = { status: 200, body: { id: "ctx1", name_enc: "fresh-enc", owner_uid: "1", epoch: 2, version: 4, bytes: 100, updated_at: "" } };
+    const c = new Client(base, "tok");
+    await c.commitContext("ctx1", 3, 100, "deadbeef", "contexts/quarantine/ctx1/0/abc", "fresh-enc");
+    expect(last.body).toMatchObject({ name_enc: "fresh-enc" });
+  });
+
+  it("commitContext omits name_enc entirely from the request body when not supplied — an ordinary content-only commit must not risk blanking the stored name", async () => {
+    reply = { status: 200, body: { id: "ctx1", name_enc: "unchanged", owner_uid: "1", epoch: 1, version: 1, bytes: 100, updated_at: "" } };
+    const c = new Client(base, "tok");
+    await c.commitContext("ctx1", 0, 100, "deadbeef", "contexts/quarantine/ctx1/0/abc");
+    expect("name_enc" in last.body).toBe(false);
+  });
+
   it("commitContext does NOT fabricate VersionConflict(0) when current_version is missing from the 409 body", async () => {
     // A well-behaved server always sends current_version, so this simulates a
     // malformed/unexpected 409 envelope. The old behavior (Number(undefined ?? 0))

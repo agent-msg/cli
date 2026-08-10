@@ -163,11 +163,11 @@ beforeEach(async () => {
       if (req.url?.startsWith("/v1/contexts/c1/members/") && req.method === "DELETE") {
         removedMembers.push(decodeURIComponent(req.url.slice("/v1/contexts/c1/members/".length)));
         ctxEpoch++;
-        return res.end(JSON.stringify({ id: "c1", name_enc: "", owner_uid: "1", epoch: ctxEpoch, version: ctxVersion, bytes: ctxHasContent ? 1 : 0, updated_at: "", role: "owner" }));
+        return res.end(JSON.stringify({ id: "c1", name_enc: lastNameEnc, owner_uid: "1", epoch: ctxEpoch, version: ctxVersion, bytes: ctxHasContent ? 1 : 0, updated_at: "", role: "owner" }));
       }
       if (req.url === "/v1/contexts/c1" && req.method === "GET") {
         return res.end(JSON.stringify({
-          id: "c1", name_enc: "", owner_uid: "1", epoch: ctxEpoch, version: ctxVersion,
+          id: "c1", name_enc: lastNameEnc, owner_uid: "1", epoch: ctxEpoch, version: ctxVersion,
           bytes: ctxHasContent ? 1 : 0, updated_at: "", role: ctxRole,
           download_url: ctxHasContent ? base + "/download-content" : undefined,
           sealed_key: ctxSealedKey || undefined,
@@ -206,7 +206,11 @@ beforeEach(async () => {
         ctxVersion++;
         ctxDownloadContent = pendingUploadContent;
         ctxHasContent = true;
-        return res.end(JSON.stringify({ id: "c1", name_enc: "", owner_uid: "1", epoch: ctxEpoch, version: ctxVersion, bytes: 0, updated_at: "", role: "owner" }));
+        // Mirrors the server: name_enc is only touched when the commit body
+        // actually supplies it (undefined on an ordinary content-only
+        // commit must leave the previously stored name untouched).
+        if (typeof body.name_enc === "string") lastNameEnc = body.name_enc;
+        return res.end(JSON.stringify({ id: "c1", name_enc: lastNameEnc, owner_uid: "1", epoch: ctxEpoch, version: ctxVersion, bytes: 0, updated_at: "", role: "owner" }));
       }
       res.end("{}");
     });
@@ -633,6 +637,33 @@ describe("agentmsg context", () => {
       // We uploaded a self-addressed envelope for the new epoch so we can
       // still read our own context after rotating.
       expect(uploadedEnvelopes.length).toBeGreaterThan(0);
+    });
+
+    // The defect this whole task exists to close: the server used to update
+    // blob_key/sha256/bytes on rotation but never name_enc, so a removed
+    // member who kept the old key could still decrypt the context's NAME
+    // (the exact exposure name encryption exists to prevent), while
+    // remaining members holding only the fresh key could not decrypt it at
+    // all. Revoke must now re-encrypt the name under the fresh key in the
+    // same commit as the body.
+    it("re-encrypts the context name on revoke: decrypts with the new key, fails with the old one", async () => {
+      expect(await cli("register", "--dev-user", "9", "--allow-insecure-http")).toBe(0);
+      await cli("context", "create", "--name", "Acme acquisition diligence");
+      await cli("context", "set", "--id", "c1", "--text", "hello", "--expect", "0");
+      const oldKey = new ContextKeys(home).get("c1")!;
+
+      const code = await cli("context", "revoke", "--id", "c1", "--user", "99");
+      expect(code).toBe(0);
+
+      const newKey = new ContextKeys(home).get("c1")!;
+      expect(newKey).not.toBe(oldKey);
+
+      // The point of the fix: the NEW key opens the name...
+      expect(await decryptSym(lastNameEnc, newKey)).toBe("Acme acquisition diligence");
+      // ...and the OLD key — the one a removed member still holds — does not.
+      // This is what proves the removed member actually lost access to the
+      // name, not just to the body.
+      await expect(decryptSym(lastNameEnc, oldKey)).rejects.toThrow();
     });
 
     // The hard requirement: a false security promise is worse than a missing

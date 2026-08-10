@@ -1222,6 +1222,19 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
       // again even though the epoch counter has moved on).
       try {
         const full = await client.getContext(id);
+        // The defect this task closes: SetContextVersion used to update
+        // blob_key/sha256/bytes on commit but never name_enc, so a removed
+        // member who kept the old key could still decrypt the context's
+        // NAME (the exact exposure name encryption exists to prevent) while
+        // remaining members holding only the fresh key could not decrypt it
+        // at all. Re-encrypt the name here, under the SAME fresh key as the
+        // body, so both move to the new epoch together. An empty stored
+        // name_enc (no name was ever set) has nothing to protect — leave
+        // newNameEnc undefined so the commit below omits name_enc entirely,
+        // matching the server's "not supplied" semantics.
+        const newNameEnc = full.name_enc
+          ? await encryptSym(await decryptSym(full.name_enc, verifiedOldKey), freshKey)
+          : undefined;
         if (full.download_url) {
           const ct = await client.download(new URL(full.download_url).pathname);
           const plaintext = await decryptSym(Buffer.from(ct).toString("utf8"), verifiedOldKey);
@@ -1229,7 +1242,16 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
           const sha256 = createHash("sha256").update(newCt).digest("hex");
           const ticket = await client.putContext(id, full.version, newCt.length, sha256);
           await client.uploadPut(ticket.upload_url, newCt, "application/octet-stream");
-          await client.commitContext(id, full.version, newCt.length, sha256, ticket.blob_key);
+          await client.commitContext(id, full.version, newCt.length, sha256, ticket.blob_key, newNameEnc);
+        } else if (newNameEnc) {
+          // No body content committed yet, but the name still needs to move
+          // to the fresh epoch — commit an empty body just to carry the name
+          // update atomically under the same CAS as everything else here.
+          const empty = Buffer.alloc(0);
+          const sha256 = createHash("sha256").update(empty).digest("hex");
+          const ticket = await client.putContext(id, full.version, 0, sha256);
+          await client.uploadPut(ticket.upload_url, empty, "application/octet-stream");
+          await client.commitContext(id, full.version, 0, sha256, ticket.blob_key, newNameEnc);
         }
         // Only now — content (if any) is safely re-encrypted and committed,
         // or there was none to begin with — is it safe to make freshKey the
