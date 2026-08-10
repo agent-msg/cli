@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import { createServer, Server, IncomingMessage, ServerResponse } from "node:http";
-import { Client, ApiError } from "../src/client.js";
+import { closeServer } from "./setup.js";
+import { Client, ApiError, VersionConflict } from "../src/client.js";
 
 // A tiny stub server that records requests and replies from a scripted table.
 interface Recorded {
@@ -33,7 +34,7 @@ beforeAll(async () => {
   const addr = server.address();
   base = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}`;
 });
-afterAll(() => new Promise<void>((r) => server.close(() => r())));
+afterAll(() => closeServer(server));
 
 describe("Client", () => {
   it("register posts the credential and returns the card", async () => {
@@ -114,6 +115,42 @@ describe("Client", () => {
       globalThis.fetch = original;
     }
   });
+
+  it("commitContext raises a typed VersionConflict carrying the server's current_version", async () => {
+    reply = { status: 409, body: { error: "version_conflict", current_version: 7 } };
+    const c = new Client(base, "tok");
+    const err = await c.commitContext("ctx1", 3, 100, "deadbeef", "contexts/quarantine/ctx1/0/abc").catch((e) => e);
+    expect(err).toBeInstanceOf(VersionConflict);
+    expect((err as VersionConflict).currentVersion).toBe(7);
+  });
+
+  it("commitContext includes name_enc in the request body when supplied", async () => {
+    reply = { status: 200, body: { id: "ctx1", name_enc: "fresh-enc", owner_uid: "1", epoch: 2, version: 4, bytes: 100, updated_at: "" } };
+    const c = new Client(base, "tok");
+    await c.commitContext("ctx1", 3, 100, "deadbeef", "contexts/quarantine/ctx1/0/abc", "fresh-enc");
+    expect(last.body).toMatchObject({ name_enc: "fresh-enc" });
+  });
+
+  it("commitContext omits name_enc entirely from the request body when not supplied — an ordinary content-only commit must not risk blanking the stored name", async () => {
+    reply = { status: 200, body: { id: "ctx1", name_enc: "unchanged", owner_uid: "1", epoch: 1, version: 1, bytes: 100, updated_at: "" } };
+    const c = new Client(base, "tok");
+    await c.commitContext("ctx1", 0, 100, "deadbeef", "contexts/quarantine/ctx1/0/abc");
+    expect("name_enc" in last.body).toBe(false);
+  });
+
+  it("commitContext does NOT fabricate VersionConflict(0) when current_version is missing from the 409 body", async () => {
+    // A well-behaved server always sends current_version, so this simulates a
+    // malformed/unexpected 409 envelope. The old behavior (Number(undefined ?? 0))
+    // would silently produce VersionConflict(0), letting a caller merge onto a
+    // version that doesn't exist and destroy the other writer's work with no
+    // visible error. The fix must instead surface a failure.
+    reply = { status: 409, body: { error: "version_conflict" } };
+    const c = new Client(base, "tok");
+    const err = await c.commitContext("ctx1", 3, 100, "deadbeef", "contexts/quarantine/ctx1/0/abc").catch((e) => e);
+    expect(err).not.toBeInstanceOf(VersionConflict);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).status).toBe(409);
+  });
 });
 
 describe("Client hardening (HARD-01)", () => {
@@ -125,8 +162,11 @@ describe("Client hardening (HARD-01)", () => {
     const orig = globalThis.fetch;
     globalThis.fetch = async () =>
       new Response("{}", { status: 200, headers: { "content-length": String(64 * 1024 * 1024) } });
-    await expect(big.inboxPage(0)).rejects.toMatchObject({ code: "response_too_large" });
-    globalThis.fetch = orig;
+    try {
+      await expect(big.inboxPage(0)).rejects.toMatchObject({ code: "response_too_large" });
+    } finally {
+      globalThis.fetch = orig;
+    }
   });
 
   it("rejects a URL that would send credentials to a remote http origin", () => {

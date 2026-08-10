@@ -28,6 +28,10 @@ interface RegisterOptions {
   note: (message: string) => void;
   githubBase?: string;
   signal?: AbortSignal;
+  // installationBoxKey is this installation's X25519 box public key (see
+  // installation-box.ts). Reported to the server so peers can later learn it
+  // from our address card and seal shared-context keys to it — see R4b.
+  installationBoxKey: string;
 }
 
 function idempotencyKey(): string {
@@ -67,7 +71,12 @@ function validateUpgrade(flow: GitHubUpgradeResponse, origin: string): void {
   }
 }
 
-function assertGuestResult(result: GuestRegistrationResponse, card: AddressCard, signature: string): void {
+function assertGuestResult(
+  result: GuestRegistrationResponse,
+  card: AddressCard,
+  signature: string,
+  installationBoxKey: string,
+): void {
   if (
     !result.token ||
     result.identity_type !== "guest" ||
@@ -84,13 +93,19 @@ function assertGuestResult(result: GuestRegistrationResponse, card: AddressCard,
     result.address_card?.verified !== card.verified ||
     result.address_card?.public_key !== card.public_key ||
     (result.address_card?.expires_at || undefined) !== card.expires_at ||
-    result.address_card?.signature !== signature
+    result.address_card?.signature !== signature ||
+    (result.address_card?.installation_box_key || "") !== installationBoxKey
   ) {
     throw new Error("Guest registration response binding mismatch");
   }
 }
 
-function assertVerifiedResult(result: VerifiedRegistrationResponse, card: AddressCard, signature: string): void {
+function assertVerifiedResult(
+  result: VerifiedRegistrationResponse,
+  card: AddressCard,
+  signature: string,
+  installationBoxKey: string,
+): void {
   if (
     !result.token ||
     result.identity_type !== "github" ||
@@ -111,7 +126,8 @@ function assertVerifiedResult(result: VerifiedRegistrationResponse, card: Addres
     result.address_card?.public_key !== card.public_key ||
     result.address_card?.github_user_id !== card.github_user_id ||
     result.address_card?.github_login !== card.github_login ||
-    result.address_card?.signature !== signature
+    result.address_card?.signature !== signature ||
+    (result.address_card?.installation_box_key || "") !== installationBoxKey
   ) {
     throw new Error("Verified registration response binding mismatch");
   }
@@ -172,9 +188,10 @@ async function finishVerified(
     signature: signChallenge(options.installation, challenge),
     address_card_signature: addressCardSignature,
     idempotency_key: idempotencyKey(),
+    installation_box_key: options.installationBoxKey,
   };
   const result = await options.client.verifiedRegistration(request);
-  assertVerifiedResult(result, card, addressCardSignature);
+  assertVerifiedResult(result, card, addressCardSignature, options.installationBoxKey);
   return result;
 }
 
@@ -237,10 +254,11 @@ export async function registerGuestFirst(options: RegisterOptions): Promise<Admi
       signature: signChallenge(options.installation, challenge, powSolution),
       address_card_signature: addressCardSignature,
       idempotency_key: idempotencyKey(),
+      installation_box_key: options.installationBoxKey,
     };
     try {
       const result = await options.client.guestRegistration(request);
-      assertGuestResult(result, card, addressCardSignature);
+      assertGuestResult(result, card, addressCardSignature, options.installationBoxKey);
       return result;
     } catch (error) {
       if (

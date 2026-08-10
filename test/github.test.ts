@@ -1,11 +1,12 @@
 import { createServer, type Server } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
 import { githubIdentity } from "../src/github.js";
+import { closeServer } from "./setup.js";
 
 let server: Server | undefined;
 
 afterEach(async () => {
-  if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));
+  if (server) await closeServer(server);
   server = undefined;
 });
 

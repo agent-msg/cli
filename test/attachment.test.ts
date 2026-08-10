@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { createServer, Server } from "node:http";
+import { closeServer } from "./setup.js";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -67,7 +68,7 @@ beforeAll(async () => {
   const a = server.address();
   base = `http://127.0.0.1:${typeof a === "object" && a ? a.port : 0}`;
 });
-afterAll(() => new Promise<void>((r) => server.close(() => r())));
+afterAll(() => closeServer(server));
 
 let bobHome: string;
 beforeEach(() => {

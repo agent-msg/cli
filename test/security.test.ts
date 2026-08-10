@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { createServer, Server } from "node:http";
+import { closeServer } from "./setup.js";
 import { mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,7 +26,7 @@ beforeEach(async () => {
   const a = server.address();
   base = `http://127.0.0.1:${typeof a === "object" && a ? a.port : 0}`;
 });
-afterEach(() => new Promise<void>((r) => server.close(() => r())));
+afterEach(() => closeServer(server));
 
 let home: string;
 async function cli(...argv: string[]) {

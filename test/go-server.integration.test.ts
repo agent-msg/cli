@@ -2,7 +2,9 @@ import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "../src/client.js";
 import { registerGuestFirst } from "../src/guest.js";
+import { installationBoxKeys } from "../src/installation-box.js";
 import { installationKeyFromSeed } from "../src/installation.js";
+import { closeServer } from "./setup.js";
 
 const serverURL = process.env.AGENTMSG_GO_SERVER;
 const expected = process.env.AGENTMSG_GO_EXPECTED_IDENTITY;
@@ -34,17 +36,19 @@ suite("real Go server admission integration", () => {
   });
 
   afterAll(async () => {
-    if (github) await new Promise<void>((resolve) => github!.close(() => resolve()));
+    if (github) await closeServer(github);
   });
 
   it(`completes the ${expected} flow against the Go implementation`, async () => {
     const key = installationKeyFromSeed(Buffer.alloc(32, 23));
+    const installationBoxKey = installationBoxKeys(key.seed).publicKey;
     const result = await registerGuestFirst({
       client: new Client(serverURL!),
       installation: key,
       serverOrigin: new URL(serverURL!).origin,
       githubBase,
       note: () => undefined,
+      installationBoxKey,
     });
     expect(result.identity_type).toBe(expected);
     expect(result.installation_id).toMatch(/^ins_/);

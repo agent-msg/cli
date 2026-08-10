@@ -2,8 +2,8 @@
 // agentmsg CLI. Encryption is the default: when the recipient's public key is
 // known (a saved contact), the message body is sealed on THIS machine before it
 // reaches the client, so the server only ever sees ciphertext.
-import { generateKeypair, seal, open, sealBytes, openBytes } from "./crypto.js";
-import { Client, ApiError } from "./client.js";
+import { generateKeypair, seal, open, sealBytes, openBytes, generateContextKey, encryptSym, decryptSym } from "./crypto.js";
+import { Client, ApiError, VersionConflict, ContextDTO, KeyEnvelope, MemberDTO } from "./client.js";
 import {
   SessionStore,
   Session,
@@ -19,7 +19,11 @@ import { Contacts, fingerprint } from "./contacts.js";
 import { deviceFlowToken, DEFAULT_CLIENT_ID } from "./github.js";
 import { normalizeServerUrl } from "./serverurl.js";
 import { InstallationStore } from "./installation.js";
+import { installationBoxKeys, InstallationBoxKeys } from "./installation-box.js";
 import { CLI_VERSION, registerGuestFirst } from "./guest.js";
+import { ContextKeys } from "./context.js";
+import { InstallationId, asInstallationId, asSessionId, asGitHubUserId } from "./ids.js";
+import { encodeRecoveryCode, decodeRecoveryCode } from "./recovery.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -32,7 +36,7 @@ Usage:
   agentmsg register [--name NAME] [--verified] [--profile NAME] Guest first
   agentmsg whoami                                       show your address card
   agentmsg card [--qr]                                  print a compact address card
-  agentmsg contact add NAME --sid SID --pubkey PK [--user ID]
+  agentmsg contact add NAME --sid SID --pubkey PK [--user ID] [--installation-box-key KEY] [--installation-id ID]
   agentmsg contact list
   agentmsg policy set --mode MODE [--allow a,b] [--i-understand-the-risk]
   agentmsg send --to NAME|SID --text TEXT [--file PATH] encrypts; --file attaches (Pro, E2EE)
@@ -43,6 +47,9 @@ Usage:
   agentmsg billing
   agentmsg unregister
   agentmsg skill install [--target claude|codex|all] [--force]
+  agentmsg context create|list|get|set|share|revoke  shared context (E2EE)
+  agentmsg context export-recovery --id ID              owner only; reprints the recovery code
+  agentmsg context import-recovery --id ID --code CODE  restore a lost local key from a recovery code
 
 Env: AGENTMSG_SERVER (default https://msg.agentmsg.org; read only by 'register' —
 other commands use the server saved in the session), AGENTMSG_HOME, AGENTMSG_PROFILE
@@ -106,11 +113,35 @@ function emit(obj: unknown): void {
 
 function compactCard(s: Session): string {
   const payload = { v: 1, name: s.nickname || undefined, sid: s.sessionId, pk: s.publicKey,
-    uid: s.githubUserId || undefined, exp: s.expiresAt || undefined };
+    uid: s.githubUserId || undefined, exp: s.expiresAt || undefined, ibk: s.installationBoxKey || undefined,
+    iid: s.installationId || undefined };
   return `am1:${Buffer.from(JSON.stringify(payload)).toString("base64url")}`;
 }
 function note(msg: string): void {
   process.stderr.write(msg + "\n");
+}
+
+// The recovery code for a shared context is shown here and ONLY here (at
+// `create`, and again on an owner-invoked `export-recovery`) — never logged,
+// never included in emit()'s machine-readable JSON on stdout, and never sent
+// anywhere. See src/recovery.ts and docs/shared-context-keys.html for why:
+// the code is generated client-side from a key the server has never seen, and
+// that property only holds if nothing ever puts the code on the wire.
+function printRecoveryCode(contextId: string, keyB64: string): void {
+  const code = encodeRecoveryCode(keyB64);
+  const bar = "=".repeat(70);
+  note("");
+  note(bar);
+  note(`RECOVERY CODE for context ${contextId} — shown once, right now.`);
+  note("");
+  note(`    ${code}`);
+  note("");
+  note("This code can restore the ENTIRE context. Write it down or store it");
+  note("somewhere offline (paper, a safe, an offline password manager). Do NOT");
+  note("paste it into chat, email, a repo, or anywhere else connected to the");
+  note("internet — anyone who has it can decrypt everything in this context.");
+  note(bar);
+  note("");
 }
 
 function cmdSkill(args: ReturnType<typeof parseArgs>): number {
@@ -176,6 +207,7 @@ function sessionOutput(s: Session, home: string): Record<string, unknown> {
     github_login: s.githubLogin || undefined,
     github_user_id: s.githubUserId || undefined,
     public_key: s.publicKey,
+    installation_box_key: s.installationBoxKey,
     service: s.serverUrl,
     server: s.serverUrl,
     address_card: s.addressCard,
@@ -187,6 +219,8 @@ function noteAddressCard(s: Session): void {
   note("Address card (share only over a trusted channel):");
   note(`  session_id: ${s.sessionId}`);
   note(`  public_key: ${s.publicKey}`);
+  if (s.installationId) note(`  installation_id: ${s.installationId}`);
+  if (s.installationBoxKey) note(`  installation_box_key: ${s.installationBoxKey}`);
   if (s.githubUserId) note(`  github_user_id: ${s.githubUserId}`);
   if (s.expiresAt) note(`  expires_at: ${s.expiresAt}`);
 }
@@ -216,11 +250,17 @@ export async function run(argv: string[]): Promise<number> {
       }
       case "card": {
         const s = loadSessionOrExit(store, home);
-        emit({ card: compactCard(s), nickname: s.nickname || undefined, session_id: s.sessionId, public_key: s.publicKey });
+        emit({
+          card: compactCard(s), nickname: s.nickname || undefined, session_id: s.sessionId,
+          public_key: s.publicKey, installation_box_key: s.installationBoxKey,
+          installation_id: s.installationId,
+        });
         return 0;
       }
       case "contact":
         return cmdContact(args, contacts);
+      case "context":
+        return await cmdContext(args, store, home);
       case "policy":
         return await cmdPolicy(args, store, home);
       case "send":
@@ -318,7 +358,17 @@ async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionSto
       noteAddressCard(current);
       return 0;
     }
-    const installation = new InstallationStore(home).loadOrCreate();
+    // Installation identity belongs to the MACHINE, not the session: it lives
+    // in the base home so every agent session here shares one identity (and
+    // therefore can decrypt the same shared-context keys). `home` is passed
+    // as legacyHome so a pre-R7 identity already sitting in this session's
+    // isolated profile dir gets promoted instead of orphaned.
+    const installation = new InstallationStore(baseHome(), { legacyHome: home }).loadOrCreate();
+    // Derived locally from the installation seed — always available with no
+    // server round trip, and deterministic, so it never drifts between the
+    // value we report at registration and the value we use for context
+    // sealing/opening elsewhere in the CLI.
+    const installationBoxKey = installationBoxKeys(installation.seed).publicKey;
     const client = new Client(srv);
     const ctl = new AbortController();
     const cancel = () => ctl.abort();
@@ -341,7 +391,7 @@ async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionSto
         }
         let r;
         try {
-          r = await client.register(credential);
+          r = await client.register(credential, installationBoxKey);
         } finally {
           credential = "";
         }
@@ -357,6 +407,8 @@ async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionSto
           privateKey: kp.privateKey,
           identityType: "github",
           verified: true,
+          installationId: r.installation_id,
+          installationBoxKey,
         };
         store.save(session);
         emit(sessionOutput(session, home));
@@ -370,6 +422,7 @@ async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionSto
         serverOrigin: new URL(srv).origin,
         signal: ctl.signal,
         note,
+        installationBoxKey,
       });
       const kp = await generateKeypair();
       const session: Session = {
@@ -387,6 +440,7 @@ async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionSto
         installationId: result.installation_id,
         expiresAt: "expires_at" in result ? result.expires_at : undefined,
         addressCard: result.address_card,
+        installationBoxKey,
       };
       store.save(session);
       emit(sessionOutput(session, home));
@@ -410,24 +464,37 @@ function cmdContact(args: ReturnType<typeof parseArgs>, contacts: Contacts): num
     if (compact) {
       if (!compact.startsWith("am1:")) { note("error: invalid address card prefix"); return 2; }
       try {
-        const p = JSON.parse(Buffer.from(compact.slice(4), "base64url").toString("utf8")) as { sid?: string; pk?: string; uid?: string };
+        const p = JSON.parse(Buffer.from(compact.slice(4), "base64url").toString("utf8")) as
+          { sid?: string; pk?: string; uid?: string; ibk?: string; iid?: string };
         if (!p.sid || !p.pk) throw new Error("missing sid or public key");
         const name = args._[1];
         if (!name) { note("usage: agentmsg contact add NAME --card CARD [--force]"); return 2; }
-        contacts.add(name, { sessionId: p.sid, publicKey: p.pk, githubUserId: p.uid || "" }, args.flags.force === true);
+        contacts.add(
+          name,
+          {
+            sessionId: asSessionId(p.sid), publicKey: p.pk, githubUserId: asGitHubUserId(p.uid || ""),
+            installationBoxKey: p.ibk || "", installationId: asInstallationId(p.iid || ""),
+          },
+          args.flags.force === true,
+        );
         emit({ status: "contact_saved", name, fingerprint: fingerprint(p.pk) });
         return 0;
       } catch { note("error: invalid address card"); return 2; }
     }
     const name = args._[1];
     if (!name || !args.flags.sid || !args.flags.pubkey) {
-      note("usage: agentmsg contact add NAME --sid SID --pubkey PK [--user ID] [--force]");
+      note("usage: agentmsg contact add NAME --sid SID --pubkey PK [--user ID] [--installation-box-key KEY] [--installation-id ID] [--force]");
       return 2;
     }
     const pubkey = String(args.flags.pubkey);
     contacts.add(
       name,
-      { sessionId: String(args.flags.sid), publicKey: pubkey, githubUserId: String(args.flags.user || "") },
+      {
+        sessionId: asSessionId(String(args.flags.sid)), publicKey: pubkey,
+        githubUserId: asGitHubUserId(String(args.flags.user || "")),
+        installationBoxKey: String(args.flags["installation-box-key"] || ""),
+        installationId: asInstallationId(String(args.flags["installation-id"] || "")),
+      },
       args.flags.force === true,
     );
     // Show the fingerprint so the human can verify it out-of-band (SEC-05).
@@ -704,6 +771,589 @@ function cliVersion(): string {
     }
   }
   return cachedVersion;
+}
+
+export interface ResolvedContextKey {
+  key: string | undefined;
+  /** True when we HAD a local key but it was for a different (or unknown)
+   *  epoch than the server's current one, and re-importing the current
+   *  envelope failed or wasn't possible — as opposed to never having had a
+   *  key for this context at all. Lets callers give a more useful message:
+   *  "wait for someone to redistribute the current key" reads very
+   *  differently from "ask the owner to share it with you". */
+  stale: boolean;
+}
+
+// Resolve a context's local decryption key, importing it from the server's
+// `sealed_key` envelope when we don't have a CURRENT one. This is the
+// receive side of member-to-member key distribution: a key gets sealed and
+// uploaded by whoever answers (see answerPendingContextKeys below), but
+// until something opens it and saves it locally, sharing never completes.
+//
+// Critical: a locally cached key is NEVER trusted just because it exists.
+// ContextKeys has no way to know whether the server has since moved to a
+// newer epoch (e.g. another member ran `revoke`, which now genuinely
+// rotates — see that command below), so every call here re-checks the
+// server's current epoch and discards + re-imports a stale local key. The
+// alternative — trusting whatever is on disk — turns a successful rotation
+// into a permanent, silent lockout for every remaining member: exactly the
+// failure mode a real rotation is supposed to prevent, not cause.
+async function resolveContextKey(
+  client: Client,
+  keys: ContextKeys,
+  boxKeys: InstallationBoxKeys,
+  id: string,
+  dto?: ContextDTO,
+): Promise<ResolvedContextKey> {
+  const entry = keys.getEntry(id);
+  const c = dto ?? (await client.getContext(id).catch(() => undefined));
+  if (!c) {
+    // Can't reach the server to check freshness — use whatever we have
+    // locally rather than fail outright on a transient network error.
+    return { key: entry?.key, stale: false };
+  }
+  if (entry && entry.epoch === c.epoch) return { key: entry.key, stale: false };
+  // No local key, or one whose epoch doesn't confirm as current — including
+  // a legacy entry with no epoch recorded at all, which is always treated as
+  // stale rather than trusted. Try to import the current envelope.
+  if (c.sealed_key) {
+    try {
+      const key = await open(c.sealed_key, boxKeys.publicKey, boxKeys.privateKey);
+      keys.save(id, key, c.epoch);
+      return { key, stale: false };
+    } catch {
+      // not addressed to us, or tampered — fall through to "stale"
+    }
+  }
+  return { key: undefined, stale: entry !== undefined };
+}
+
+function noLocalKeyMessage(id: string, resolved: ResolvedContextKey): string {
+  return resolved.stale
+    ? `error: your local key for context ${id} is from an older epoch, and no current envelope has reached you yet. ` +
+      `Wait for another organization member to run an agentmsg command (piggyback answering delivers it automatically), then retry.`
+    : `error: no local key for context ${id} — ask the owner to share it again.`;
+}
+
+// Piggyback answering: rides on any context command the agent already runs.
+// For each outstanding pending authorisation we hold the key for, seal it and
+// upload. Quiet on success, and a failure here must never break the command
+// the user actually asked for — hence the outer try/catch swallowing
+// everything.
+//
+// The recipient's box key is sourced from the SERVER's per-context member
+// list (GET /v1/contexts/{id}/members), never from the local contact book.
+// Two things this closes, both real defects in earlier revisions of this
+// feature:
+//
+//   - Propagation gap: a pending member reached only through the acting
+//     keyholder's own address book is invisible whenever that member was
+//     added by someone else and never exchanged cards with this keyholder.
+//     The server already knows every current member's installation and box
+//     key (it is the authority that granted them access in the first
+//     place), so reading from there means every pending member is reachable,
+//     contacts or not.
+//   - Staleness: a locally cached contact's installationBoxKey can lag the
+//     truth if the member's installation rotates its key without every
+//     keyholder's cached copy catching up. The server's member list is
+//     always current, so this can never seal with a box key that isn't the
+//     one currently on file for that installation slot.
+//
+// A pending entry whose installation the server's member list has no CURRENT
+// box key for (e.g. a member added without ever registering one) is left
+// pending rather than answered with anything — there is nothing safe to seal
+// with.
+async function answerPendingContextKeys(
+  client: Client,
+  keys: ContextKeys,
+  selfInstallationId?: InstallationId,
+): Promise<void> {
+  try {
+    const pending = await client.pendingContextKeys();
+    if (!Array.isArray(pending) || pending.length === 0) return;
+    const byContext = new Map<string, KeyEnvelope[]>();
+    // Box keys are per-context (a member's installation only needs looking
+    // up once per context, however many pending entries it has), fetched
+    // lazily and cached across this pass.
+    const boxKeysByContext = new Map<string, Map<InstallationId, string>>();
+    async function boxKeyFor(contextId: string, installationId: InstallationId): Promise<string | undefined> {
+      let byInstallation = boxKeysByContext.get(contextId);
+      if (!byInstallation) {
+        byInstallation = new Map();
+        try {
+          const members: MemberDTO[] = await client.listContextMembers(contextId);
+          for (const m of members) {
+            if (m.installation_id && m.installation_box_key) {
+              byInstallation.set(m.installation_id, m.installation_box_key);
+            }
+          }
+        } catch {
+          // Leave byInstallation empty; every entry for this context stays
+          // pending this round rather than failing the whole command.
+        }
+        boxKeysByContext.set(contextId, byInstallation);
+      }
+      return byInstallation.get(installationId);
+    }
+    for (const p of pending) {
+      if (!p?.context_id || !p.recipient_installation) continue;
+      if (selfInstallationId && p.recipient_installation === selfInstallationId) continue;
+      const entry = keys.getEntry(p.context_id);
+      if (!entry) continue; // we can't answer for a context we hold no key for
+      // Critical: the pending entry names the epoch it needs answered for.
+      // A locally held key from a DIFFERENT epoch (older — e.g. we haven't
+      // caught up to a rotation yet, or in principle any mismatch at all)
+      // must never be sealed and uploaded for it. The server refuses to
+      // overwrite an existing envelope in a (context, epoch, installation)
+      // slot, so answering with the wrong key doesn't just fail to help —
+      // it permanently blocks any later CORRECT answer to that exact slot,
+      // leaving the recipient locked out with no recovery path. Leave it
+      // pending instead, so a keyholder who actually has the current
+      // epoch's key can answer it.
+      if (entry.epoch !== p.epoch) continue;
+      const key = entry.key;
+      const boxKey = await boxKeyFor(p.context_id, p.recipient_installation);
+      if (!boxKey) continue;
+      const sealedKey = await seal(key, boxKey);
+      const list = byContext.get(p.context_id) ?? [];
+      list.push({ recipient_installation: p.recipient_installation, sealed_key: sealedKey });
+      byContext.set(p.context_id, list);
+    }
+    for (const [contextId, envelopes] of byContext) {
+      await client.uploadContextKeys(contextId, envelopes).catch(() => {});
+    }
+  } catch {
+    // Never let a failed answer break the command the user actually asked for.
+  }
+}
+
+// Shared contexts. The document and its name are encrypted with a symmetric
+// key held locally; the server stores ciphertext and a version number.
+async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStore, home: string): Promise<number> {
+  const sub = args._[0];
+  const s = loadSessionOrExit(store, home);
+  const client = new Client(s.serverUrl, s.token);
+  // contexts.json and the installation identity both belong to the machine,
+  // not this session — they live in the base home (see cmdRegister for why),
+  // with `home` (this session's isolated profile dir) as the legacy-migration
+  // source for a pre-R7 identity.
+  const keys = new ContextKeys(baseHome());
+  const contacts = new Contacts(home);
+  const installation = new InstallationStore(baseHome(), { legacyHome: home }).loadOrCreate();
+  const boxKeys = installationBoxKeys(installation.seed);
+  // The verified/dev-user registration response (POST /v1/register) does not
+  // carry installation_id, unlike the guest flow — so a session created that
+  // way has no s.installationId cached locally. Fall back to asking the
+  // server for our own current address card, which always has it. This is
+  // needed both to skip ourselves in the pending list below and to
+  // self-address the envelope during a real key rotation on revoke.
+  const selfInstallationIdRaw =
+    s.installationId || (await client.addressCard().then((c) => c.installation_id).catch(() => undefined));
+  const selfInstallationId = selfInstallationIdRaw ? asInstallationId(selfInstallationIdRaw) : undefined;
+
+  // Any context command answers what pending authorisations it can, in
+  // passing — no daemon, no separate command.
+  await answerPendingContextKeys(client, keys, selfInstallationId);
+
+  if (sub === "create") {
+    const name = args.flags.name !== undefined ? String(args.flags.name) : "";
+    if (!name) {
+      note("usage: agentmsg context create --name NAME");
+      return 2;
+    }
+    const key = await generateContextKey();
+    const c = await client.createContext(await encryptSym(name, key));
+    keys.save(c.id, key, c.epoch);
+    // Shown once, right now — at the moment of creation, when the user's
+    // attention is actually on this context and they're the one responsible
+    // for it. Not an afterthought command the user has to think to run.
+    printRecoveryCode(c.id, key);
+    emit({ context_id: c.id, version: c.version, epoch: c.epoch });
+    return 0;
+  }
+
+  if (sub === "list") {
+    const list = await client.listContexts();
+    emit(await Promise.all(list.map(async (c) => {
+      const entry = keys.getEntry(c.id);
+      let name = "[no local key]";
+      if (entry && entry.epoch !== undefined && entry.epoch !== c.epoch) {
+        // We know for certain this key is stale (unlike the legacy/unknown-
+        // epoch case below, which is only a guess after a failed decrypt).
+        name = `[cannot decrypt — key is from an older epoch; run 'agentmsg context get --id ${c.id}' to try re-importing]`;
+      } else if (entry) {
+        try {
+          name = await decryptSym(c.name_enc, entry.key);
+        } catch {
+          name = "[cannot decrypt — key may be from an older epoch]";
+        }
+      }
+      return { context_id: c.id, name, version: c.version, epoch: c.epoch, role: c.role };
+    })));
+    return 0;
+  }
+
+  if (sub === "get") {
+    const id = String(args.flags.id || "");
+    if (!id) {
+      note("usage: agentmsg context get --id ID");
+      return 2;
+    }
+    const c = await client.getContext(id);
+    const resolved = await resolveContextKey(client, keys, boxKeys, id, c);
+    if (!resolved.key) {
+      note(noLocalKeyMessage(id, resolved));
+      return 1;
+    }
+    const key = resolved.key;
+    let text = "";
+    if (c.download_url) {
+      const ct = await client.download(new URL(c.download_url).pathname);
+      try {
+        text = await decryptSym(Buffer.from(ct).toString("utf8"), key);
+      } catch {
+        // Epoch matched, but the bytes didn't decrypt anyway — e.g. a
+        // rotation that re-keyed but never finished re-encrypting content.
+        // Never let the raw crypto exception reach the user.
+        note(`error: could not decrypt content for context ${id} — the local key does not match the last write. ` +
+          `This can happen mid-rotation; try again shortly, or ask the owner to confirm 'context revoke' completed.`);
+        return 1;
+      }
+    }
+    emit({ context_id: c.id, version: c.version, epoch: c.epoch, text });
+    return 0;
+  }
+
+  if (sub === "set") {
+    const id = String(args.flags.id || "");
+    const text = args.flags.text !== undefined ? String(args.flags.text) : "";
+    if (!id || !text) {
+      note("usage: agentmsg context set --id ID --text TEXT [--expect VERSION]");
+      return 2;
+    }
+    const resolved = await resolveContextKey(client, keys, boxKeys, id);
+    if (!resolved.key) {
+      note(noLocalKeyMessage(id, resolved));
+      return 1;
+    }
+    const key = resolved.key;
+    const expect = args.flags.expect !== undefined
+      ? parseInt(String(args.flags.expect), 10)
+      : (await client.getContext(id)).version;
+
+    const ct = Buffer.from(await encryptSym(text, key), "utf8");
+    const sha256 = createHash("sha256").update(ct).digest("hex");
+    try {
+      const ticket = await client.putContext(id, expect, ct.length, sha256);
+      await client.uploadPut(ticket.upload_url, ct, "application/octet-stream");
+      const done = await client.commitContext(id, expect, ct.length, sha256, ticket.blob_key);
+      emit({ context_id: id, version: done.version });
+      return 0;
+    } catch (e) {
+      if (e instanceof VersionConflict) {
+        // Conflicts are expected here, not exceptional. Tell the agent exactly
+        // how to fetch the version it missed so it can merge and retry.
+        note(`error: version_conflict — someone else wrote version ${e.currentVersion} while you were editing.`);
+        note(`   Fetch it, merge your change into it, then retry with the new version:`);
+        note(`      agentmsg context get --id ${id}`);
+        note(`      agentmsg context set --id ${id} --text <merged> --expect ${e.currentVersion}`);
+        return 1;
+      }
+      throw e;
+    }
+  }
+
+  if (sub === "share") {
+    const id = String(args.flags.id || "");
+    const to = String(args.flags.to || "");
+    const role = args.flags.role ? String(args.flags.role) : "writer";
+    if (!id || !to) {
+      note("usage: agentmsg context share --id ID --to NAME|SID [--role writer|reader]");
+      return 2;
+    }
+    const resolved = await resolveContextKey(client, keys, boxKeys, id);
+    if (!resolved.key) {
+      note(noLocalKeyMessage(id, resolved));
+      return 1;
+    }
+    const key = resolved.key;
+    const addr = contacts.resolve(to);
+    if (!addr?.publicKey || !addr.githubUserId) {
+      note(`error: need a saved contact with a public key and numeric id for "${to}".`);
+      note(`   agentmsg contact add ${to} --sid <sid> --pubkey <pubkey> --user <id>`);
+      return 1;
+    }
+    // Context keys must be sealed to the recipient's INSTALLATION box key,
+    // not addr.publicKey (their session's ephemeral messaging keypair) — the
+    // two are independent X25519 pairs, and only the installation key is
+    // opened by resolveContextKey() on their end (see R4b). A contact saved
+    // before this field existed has none: degrade with a clear message
+    // rather than send an envelope they can never open.
+    if (!addr.installationBoxKey) {
+      note(`error: this contact's card predates installation keys; ask them to re-share.`);
+      note(`   They should re-run 'agentmsg whoami' or 'agentmsg card' and re-send you their card,`);
+      note(`   then: agentmsg contact add ${to} --sid <sid> --pubkey <pubkey> --user <id> --installation-box-key <key> --force`);
+      return 1;
+    }
+    // Envelopes MUST be addressed by the recipient's INSTALLATION id (stable
+    // across their sessions), never a session id: the server stores this
+    // value verbatim as ContextMember.RecipientInstallation, and the
+    // recipient's read path looks envelopes up by their real
+    // sess.InstallationID. Addressing by session id means the two never
+    // match, so sealed_key is never returned to them — and because the
+    // server treats a member as "already answered" once ANY envelope exists
+    // under their stored value, the recipient is then permanently stuck
+    // with no recovery path. A contact saved (or a card pasted) before
+    // installation identity existed has no installationId: refuse here,
+    // clearly, rather than silently falling back to sessionId.
+    if (!addr.installationId) {
+      note(`error: this contact's card predates installation identity; ask them to re-share their card.`);
+      note(`   They should re-run 'agentmsg whoami' or 'agentmsg card' and re-send you their card,`);
+      note(`   then: agentmsg contact add ${to} --sid <sid> --pubkey <pubkey> --user <id> --installation-box-key <key> --installation-id <id> --force`);
+      return 1;
+    }
+    await client.addContextMember(id, addr.githubUserId, role, addr.installationId, await seal(key, addr.installationBoxKey));
+    emit({ status: "shared", context_id: id, with: to, role });
+    return 0;
+  }
+
+  if (sub === "revoke") {
+    const id = String(args.flags.id || "");
+    const uid = asGitHubUserId(String(args.flags.user || ""));
+    if (!id || !uid) {
+      note("usage: agentmsg context revoke --id ID --user GITHUB_USER_ID");
+      return 2;
+    }
+    // Honest revoke, checked BEFORE we touch anything server-side:
+    // removeContextMember always bumps the epoch (see the server's
+    // handleRemoveContextMember), and bumping the epoch alone has zero
+    // cryptographic effect — the removed member's old key still opens
+    // anything written afterward unless the content is actually
+    // re-encrypted under a fresh key they never receive. That re-encryption
+    // needs the CURRENT epoch's key to decrypt the existing content first.
+    // If our local key is stale (an older epoch) or absent, we must refuse
+    // outright rather than advance the epoch anyway: doing so would leave
+    // the context with content nobody can decrypt plus a "fresh" key that
+    // never matched what was actually stored — silent, unrecoverable data
+    // loss dressed up as a successful command. Try to resolve/import the
+    // current key first (the same path `get`/`set`/`export-recovery` use),
+    // and fail loudly — no removeContextMember call, no epoch bump, no key
+    // saved — if we still don't have a current one.
+    const resolved = await resolveContextKey(client, keys, boxKeys, id);
+    let oldKey = resolved.key;
+    let resolvedStale = resolved.stale;
+    if (!oldKey) {
+      // R15 fallback: a "stale" verdict here can mean two different things,
+      // and resolveContextKey's plain epoch-string comparison cannot tell
+      // them apart. (1) genuinely stale — someone else rotated for real and
+      // we never got the new envelope; nothing safe to do. (2) OUR OWN prior
+      // revoke attempt bumped the epoch (removeContextMember does that
+      // unconditionally, before any of the content re-encryption below runs
+      // — see handleRemoveContextMember on the server) but then failed
+      // before committing the re-encrypted content — so the epoch counter
+      // moved even though the actual content key never changed. Case 2 must
+      // still let this command proceed, or a mid-flight failure would
+      // permanently strand the owner: no envelope exists yet for the bumped
+      // epoch (self-delivery happens only after a successful commit, further
+      // below), so the ordinary resolveContextKey path can never recover on
+      // its own.
+      //
+      // Distinguish them the only way that's actually authoritative: try
+      // decrypting what the server currently has stored with our locally
+      // cached (epoch-mismatched) key. Case 2 succeeds, because the content
+      // was never actually re-encrypted (commit is the ONLY step that moves
+      // it — see handleCommitContext on the server). Case 1 fails, because
+      // the content genuinely is under a different key now.
+      const entry = keys.getEntry(id);
+      if (entry?.key) {
+        try {
+          const dto = await client.getContext(id);
+          if (dto.download_url) {
+            const ct = await client.download(new URL(dto.download_url).pathname);
+            await decryptSym(Buffer.from(ct).toString("utf8"), entry.key);
+            oldKey = entry.key;
+            resolvedStale = false;
+          }
+        } catch {
+          // Either no content to verify against, or it didn't decrypt with
+          // our stale key — genuinely stale. Fall through to the refusal
+          // below, unchanged from before this fallback existed.
+        }
+      }
+    }
+    if (!oldKey) {
+      note(
+        `error: cannot revoke on context ${id} — your local key is ${resolvedStale ? "from an older epoch" : "missing"}, ` +
+          `so there is nothing to safely re-encrypt the existing content with. ` +
+          `Recover the current key first — run 'agentmsg context get --id ${id}' to import a fresh envelope, ` +
+          `or 'agentmsg context import-recovery' if you have a recovery code — then retry revoke.`,
+      );
+      return 1;
+    }
+    const c = await client.removeContextMember(id, uid);
+
+    // We now know (from the check above) that we hold the pre-revoke
+    // CURRENT key, so rotation always attempts to run — a failure past this
+    // point is a network/partial-completion issue, not "we never had the
+    // key to begin with".
+    let rotated = false;
+    {
+      const freshKey = await generateContextKey();
+      const verifiedOldKey = oldKey;
+      // R15: the fresh key must NOT be persisted locally until we know the
+      // rotation actually completed. It used to be saved here, before any of
+      // the network calls below — reasoned (wrongly) as "safe because a
+      // mid-rotation crash degrades to retry, not lockout". It doesn't: this
+      // whole step runs AFTER removeContextMember above, which has already
+      // unconditionally bumped the epoch (see handleRemoveContextMember on
+      // the server) — content re-encryption hasn't happened yet at that
+      // point. If we saved freshKey here and then failed before commit, the
+      // locally stored key would stop matching what the server actually has
+      // stored (still under the OLD key, since commit — the only step that
+      // moves BlobKey, see handleCommitContext — never ran), with no
+      // self-envelope yet uploaded to re-import from either. That is a
+      // self-inflicted, unrecoverable lockout: worse than the bug this
+      // rotation exists to fix. So freshKey is only committed to local
+      // storage once every step that actually changes what's on the server
+      // has succeeded — see the `keys.save` call at the end of this
+      // try-block. Until then, the on-disk key stays the OLD one, which
+      // still opens the content the server still has (the fallback a few
+      // lines up, in the `!oldKey` branch, is what lets a retry find it
+      // again even though the epoch counter has moved on).
+      try {
+        const full = await client.getContext(id);
+        // The defect this task closes: SetContextVersion used to update
+        // blob_key/sha256/bytes on commit but never name_enc, so a removed
+        // member who kept the old key could still decrypt the context's
+        // NAME (the exact exposure name encryption exists to prevent) while
+        // remaining members holding only the fresh key could not decrypt it
+        // at all. Re-encrypt the name here, under the SAME fresh key as the
+        // body, so both move to the new epoch together. An empty stored
+        // name_enc (no name was ever set) has nothing to protect — leave
+        // newNameEnc undefined so the commit below omits name_enc entirely,
+        // matching the server's "not supplied" semantics.
+        const newNameEnc = full.name_enc
+          ? await encryptSym(await decryptSym(full.name_enc, verifiedOldKey), freshKey)
+          : undefined;
+        if (full.download_url) {
+          const ct = await client.download(new URL(full.download_url).pathname);
+          const plaintext = await decryptSym(Buffer.from(ct).toString("utf8"), verifiedOldKey);
+          const newCt = Buffer.from(await encryptSym(plaintext, freshKey), "utf8");
+          const sha256 = createHash("sha256").update(newCt).digest("hex");
+          const ticket = await client.putContext(id, full.version, newCt.length, sha256);
+          await client.uploadPut(ticket.upload_url, newCt, "application/octet-stream");
+          await client.commitContext(id, full.version, newCt.length, sha256, ticket.blob_key, newNameEnc);
+        } else if (newNameEnc) {
+          // No body content committed yet, but the name still needs to move
+          // to the fresh epoch — commit an empty body just to carry the name
+          // update atomically under the same CAS as everything else here.
+          const empty = Buffer.alloc(0);
+          const sha256 = createHash("sha256").update(empty).digest("hex");
+          const ticket = await client.putContext(id, full.version, 0, sha256);
+          await client.uploadPut(ticket.upload_url, empty, "application/octet-stream");
+          await client.commitContext(id, full.version, 0, sha256, ticket.blob_key, newNameEnc);
+        }
+        // Only now — content (if any) is safely re-encrypted and committed,
+        // or there was none to begin with — is it safe to make freshKey the
+        // key of record locally. Everything from here on (self-delivery,
+        // piggyback answering) is best-effort: its failure doesn't strand
+        // us, because the local key and the server's content already agree.
+        keys.save(id, freshKey, c.epoch);
+        // Deliver the fresh key to OURSELVES too: the server trusts the
+        // owner unconditionally for this (see handleRotateKeys), and doing
+        // so is what lets GET /v1/contexts/pending see us as a keyholder for
+        // the new epoch — which is how we then discover the remaining
+        // members to answer, via the exact piggyback path used elsewhere.
+        if (selfInstallationId) {
+          const selfSealed = await seal(freshKey, boxKeys.publicKey);
+          await client.uploadContextKeys(id, [{ recipient_installation: selfInstallationId, sealed_key: selfSealed }]);
+        } else {
+          // Minor but real: don't silently claim success while skipping our
+          // own delivery. The rotation itself (fresh key + re-encrypted
+          // content, both already done above) is still genuine, but other
+          // sessions on this machine won't be able to import it from the
+          // server until this resolves.
+          note("warning: could not resolve our own installation id, so the fresh key was not uploaded for the server to hand to other sessions on this machine. It is saved locally here, though.");
+        }
+        await answerPendingContextKeys(client, keys, selfInstallationId);
+        rotated = true;
+      } catch (e) {
+        note(`warning: key rotation after revoke did not fully complete (${(e as Error).message}). ` +
+          `The server epoch was advanced, but your local key was left untouched — it still matches what the ` +
+          `server has stored, so re-running 'agentmsg context revoke --id ${id} --user ${uid}' should finish the job.`);
+      }
+    }
+
+    if (rotated) {
+      note(">> access revoked and the context key was rotated: the removed member's key no longer decrypts new writes.");
+    } else {
+      note(">> access revoked and key epoch advanced.");
+    }
+    note(">> NOTE: this does not undo anything the removed member already read — that copy is on their machine.");
+    emit({ context_id: id, epoch: c.epoch, rotated });
+    return 0;
+  }
+
+  if (sub === "export-recovery") {
+    const id = String(args.flags.id || "");
+    if (!id) {
+      note("usage: agentmsg context export-recovery --id ID");
+      return 2;
+    }
+    const c = await client.getContext(id);
+    // Owner-only, by design: any keyholder could otherwise re-export the
+    // recovery code, and a departing member who did so would keep permanent
+    // full access that a subsequent key rotation cannot revoke (rotation
+    // only stops NEW envelopes reaching them — it does nothing about a
+    // recovery code they already hold). The role check trusts the server's
+    // membership record, the one thing the server DOES get to decide.
+    if (c.role !== "owner") {
+      note(`error: export-recovery is owner-only — the server reports your role on context ${id} as "${c.role ?? "unknown"}".`);
+      note("   Ask the context owner to export and share it with you instead.");
+      return 1;
+    }
+    const resolved = await resolveContextKey(client, keys, boxKeys, id, c);
+    if (!resolved.key) {
+      note(noLocalKeyMessage(id, resolved));
+      return 1;
+    }
+    printRecoveryCode(id, resolved.key);
+    emit({ context_id: id, epoch: c.epoch });
+    return 0;
+  }
+
+  if (sub === "import-recovery") {
+    const id = String(args.flags.id || "");
+    const code = args.flags.code !== undefined ? String(args.flags.code) : "";
+    if (!id || !code) {
+      note("usage: agentmsg context import-recovery --id ID --code CODE");
+      return 2;
+    }
+    let key: string;
+    try {
+      key = decodeRecoveryCode(code);
+    } catch (e) {
+      note(`error: ${(e as Error).message}`);
+      return 1;
+    }
+    // Best-effort epoch lookup: restoring the key locally is the whole point
+    // of this command (it's meant to work even when things are in a bad
+    // state), so a server that's unreachable right now must not block it —
+    // the entry is simply saved with an "unknown" epoch, which downstream
+    // reads already treat as needing a freshness check (see context.ts).
+    let epoch: number | undefined;
+    try {
+      epoch = (await client.getContext(id)).epoch;
+    } catch {
+      // fall through with epoch left undefined
+    }
+    keys.save(id, key, epoch);
+    emit({ context_id: id, epoch, status: "restored" });
+    return 0;
+  }
+
+  note("usage: agentmsg context create|list|get|set|share|revoke|export-recovery|import-recovery");
+  return 2;
 }
 
 async function cmdSubscribe(args: ReturnType<typeof parseArgs>, store: SessionStore, home?: string): Promise<number> {

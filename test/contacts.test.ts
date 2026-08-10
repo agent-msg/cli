@@ -15,15 +15,43 @@ describe("Contacts", () => {
 
   it("adds and resolves a contact by name", () => {
     const c = new Contacts(home);
-    c.add("carol", { sessionId: "sid_c", publicKey: "PK_c", githubUserId: "55" });
-    expect(c.resolve("carol")).toEqual({ sessionId: "sid_c", publicKey: "PK_c", githubUserId: "55" });
+    c.add("carol", {
+      sessionId: "sid_c", publicKey: "PK_c", githubUserId: "55",
+      installationBoxKey: "IBK_c", installationId: "install_c",
+    });
+    expect(c.resolve("carol")).toEqual({
+      sessionId: "sid_c", publicKey: "PK_c", githubUserId: "55",
+      installationBoxKey: "IBK_c", installationId: "install_c",
+    });
   });
 
   it("resolves a raw session id even if not a saved contact (no pubkey)", () => {
     const c = new Contacts(home);
     // A 32-hex-ish session id passed directly still resolves to an address
     // with no known public key, so send falls back to plaintext.
-    expect(c.resolve("deadbeef")).toEqual({ sessionId: "deadbeef", publicKey: "", githubUserId: "" });
+    expect(c.resolve("deadbeef")).toEqual({
+      sessionId: "deadbeef", publicKey: "", githubUserId: "", installationBoxKey: "", installationId: "",
+    });
+  });
+
+  // installationId must be a genuinely distinct field from sessionId: they
+  // identify different things (a session vs. a machine) and must never be
+  // conflated on disk.
+  it("keeps installationId distinct from sessionId, and defaults a missing one to empty string", () => {
+    const c = new Contacts(home);
+    c.add("dave", {
+      sessionId: "sid_d", publicKey: "PK_d", githubUserId: "77",
+      installationBoxKey: "IBK_d", installationId: "install_d",
+    });
+    const saved = c.resolve("dave")!;
+    expect(saved.installationId).toBe("install_d");
+    expect(saved.installationId).not.toBe(saved.sessionId);
+
+    // A contact saved before installationId existed (field omitted) must
+    // load with installationId defaulted to "", not undefined and never
+    // silently backfilled from sessionId.
+    c.add("eve", { sessionId: "sid_e", publicKey: "PK_e", githubUserId: "88", installationBoxKey: "" } as any);
+    expect(c.resolve("eve")!.installationId).toBe("");
   });
 
   it("prefers a saved contact over treating the arg as a raw sid", () => {

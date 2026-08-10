@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign } from "node:crypto";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
 const PKCS8_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
@@ -57,6 +57,12 @@ export function generateInstallationKey(): InstallationKey {
   return installationKeyFromSeed(Buffer.from(der.subarray(der.length - 32)));
 }
 
+// installationBoxKeys() (the shared-context X25519 identity derived from this
+// seed) lives in ./installation-box.js now — see that file's header for why
+// it was split out. Import it from there directly; it is not re-exported
+// here, so pulling in InstallationStore/atomicWritePrivate never drags in
+// libsodium's WASM bootstrap.
+
 function ensureSecureHome(home: string): void {
   if (existsSync(home)) {
     const st = lstatSync(home);
@@ -66,7 +72,30 @@ function ensureSecureHome(home: string): void {
   } else {
     mkdirSync(home, { recursive: true, mode: 0o700 });
   }
-  if (process.platform === "win32") hardenWindowsDirectory(home);
+  if (process.platform === "win32") hardenWindowsDirectoryOnce(home);
+}
+
+// hardenWindowsDirectory spawns two synchronous child processes (whoami.exe,
+// then icacls.exe). ensureSecureHome() above runs on every single call to
+// atomicWritePrivate(), and one CLI invocation can write several private
+// files (installation key, installation meta, session token, contexts
+// store, ...) — each triggering its own pair of blocking spawns. On GitHub's
+// Windows runners those two process spawns alone routinely cost more than a
+// second; a handful of writes in one command is enough to blow past a 5s
+// test timeout before any network I/O even happens. This is what was making
+// `context.test.ts` slow/hang specifically on Windows.
+//
+// Nothing in this codebase loosens an AGENTMSG_HOME directory's ACL once
+// set, so re-hardening the same directory on every write is redundant, not
+// merely cautious: cache which directories this process has already
+// restricted and skip the repeat spawns. Keyed by resolved, lower-cased path
+// since Windows filesystem paths are case-insensitive.
+const hardenedWindowsDirs = new Set<string>();
+function hardenWindowsDirectoryOnce(path: string): void {
+  const key = resolve(path).toLowerCase();
+  if (hardenedWindowsDirs.has(key)) return;
+  hardenWindowsDirectory(path);
+  hardenedWindowsDirs.add(key);
 }
 
 function hardenWindowsDirectory(path: string): void {
@@ -243,13 +272,44 @@ function keychainSet(home: string, seed: Buffer): boolean {
   return result.status === 0;
 }
 
+/** Reads an existing installation identity from `home` without creating one.
+ *  Returns null (never throws) if none is present or it cannot be read — the
+ *  caller decides whether that is expected (a plain legacy-migration probe)
+ *  or an error. Mirrors the read half of InstallationStore#loadOrCreate. */
+function tryReadInstallation(home: string): { seed: Buffer; meta: InstallationMeta } | null {
+  const metaFile = join(home, "installation.json");
+  const keyFile = join(home, "installation.key");
+  if (!existsSync(metaFile) || lstatSync(metaFile).isSymbolicLink()) return null;
+  let meta: InstallationMeta;
+  try {
+    meta = JSON.parse(readFileSync(metaFile, "utf8")) as InstallationMeta;
+  } catch {
+    return null;
+  }
+  let seed = meta.storage === "keychain" ? keychainGet(home) : null;
+  if (!seed && existsSync(keyFile)) {
+    try {
+      seed = readSecureSeed(keyFile);
+    } catch {
+      return null;
+    }
+  }
+  return seed ? { seed, meta } : null;
+}
+
 export class InstallationStore {
   private readonly keyFile: string;
   private readonly metaFile: string;
+  // A profile-scoped home that may hold an installation identity minted
+  // before installation/context state moved to the base home (R7). Checked
+  // only when nothing already exists at `home`, and only to migrate — never
+  // to override an identity that already lives at `home`.
+  private readonly legacyHome?: string;
 
-  constructor(private readonly home: string) {
+  constructor(private readonly home: string, opts?: { legacyHome?: string }) {
     this.keyFile = join(home, "installation.key");
     this.metaFile = join(home, "installation.json");
+    this.legacyHome = opts?.legacyHome;
   }
 
   loadOrCreate(): InstallationKey {
@@ -262,6 +322,22 @@ export class InstallationStore {
     let seed = meta?.storage === "keychain" ? keychainGet(this.home) : null;
     if (!seed && existsSync(this.keyFile)) seed = readSecureSeed(this.keyFile);
     if (meta && !seed) throw new Error("installation private key is unavailable; refusing to create a new identity");
+
+    // Nothing at `home` yet: before minting a brand-new identity, check
+    // whether a pre-R7 profile-scoped home already has one. Minting fresh
+    // here would silently orphan every shared-context key the user holds,
+    // sealed to that old identity.
+    if (!seed && this.legacyHome && this.legacyHome !== this.home) {
+      const legacy = tryReadInstallation(this.legacyHome);
+      if (legacy) {
+        seed = legacy.seed;
+        const storage = keychainSet(this.home, seed) ? "keychain" : "file";
+        if (storage === "file") atomicWritePrivate(this.keyFile, b64url(seed) + "\n");
+        meta = { version: 1, algorithm: "ed25519", public_key: legacy.meta.public_key, storage };
+        atomicWritePrivate(this.metaFile, JSON.stringify(meta, null, 2) + "\n");
+        return installationKeyFromSeed(seed);
+      }
+    }
 
     if (!seed) {
       const generated = generateInstallationKey();

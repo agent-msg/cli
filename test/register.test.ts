@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createServer, Server } from "node:http";
+import { closeServer } from "./setup.js";
 import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
@@ -15,7 +16,12 @@ describe("defaultHome + profiles", () => {
     delete process.env.CLAUDE_CODE_SESSION_ID;
   });
   afterEach(() => {
-    process.env.AGENTMSG_HOME = savedHome;
+    // `process.env.X = undefined` sets X to the literal string "undefined"
+    // rather than deleting it (a real Node.js footgun) — guard it exactly
+    // like the two lines below already do, so a home-less starting state
+    // doesn't leak a bogus "undefined" AGENTMSG_HOME into later tests.
+    if (savedHome === undefined) delete process.env.AGENTMSG_HOME;
+    else process.env.AGENTMSG_HOME = savedHome;
     if (savedProfile === undefined) delete process.env.AGENTMSG_PROFILE;
     else process.env.AGENTMSG_PROFILE = savedProfile;
     if (savedAgent === undefined) delete process.env.CLAUDE_CODE_SESSION_ID;
@@ -126,7 +132,7 @@ beforeEach(async () => {
   const a = server.address();
   base = `http://127.0.0.1:${typeof a === "object" && a ? a.port : 0}`;
 });
-afterEach(() => new Promise<void>((r) => server.close(() => r())));
+afterEach(() => closeServer(server));
 
 let home: string;
 beforeEach(() => (home = mkdtempSync(join(tmpdir(), "amsg-reg-"))));

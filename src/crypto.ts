@@ -74,3 +74,32 @@ export async function openBytes(
   const sk = s.from_base64(privateKeyB64, s.base64_variants.ORIGINAL);
   return s.crypto_box_seal_open(ciphertext, pk, sk); // throws on auth failure
 }
+
+/** A fresh symmetric key for one shared context. Base64, shared with members
+ *  by sealing it to each member's public key — never sent to the server bare. */
+export async function generateContextKey(): Promise<string> {
+  const s = await sodium();
+  return s.to_base64(s.randombytes_buf(s.crypto_secretbox_KEYBYTES), s.base64_variants.ORIGINAL);
+}
+
+/** Encrypt with a shared context key. The nonce is prepended to the ciphertext,
+ *  so callers hold one opaque string. */
+export async function encryptSym(plaintext: string, keyB64: string): Promise<string> {
+  const s = await sodium();
+  const key = s.from_base64(keyB64, s.base64_variants.ORIGINAL);
+  const nonce = s.randombytes_buf(s.crypto_secretbox_NONCEBYTES);
+  const ct = s.crypto_secretbox_easy(s.from_string(plaintext), nonce, key);
+  const joined = new Uint8Array(nonce.length + ct.length);
+  joined.set(nonce);
+  joined.set(ct, nonce.length);
+  return s.to_base64(joined, s.base64_variants.ORIGINAL);
+}
+
+export async function decryptSym(ciphertextB64: string, keyB64: string): Promise<string> {
+  const s = await sodium();
+  const key = s.from_base64(keyB64, s.base64_variants.ORIGINAL);
+  const raw = s.from_base64(ciphertextB64, s.base64_variants.ORIGINAL);
+  const nonce = raw.slice(0, s.crypto_secretbox_NONCEBYTES);
+  const ct = raw.slice(s.crypto_secretbox_NONCEBYTES);
+  return s.to_string(s.crypto_secretbox_open_easy(ct, nonce, key));
+}

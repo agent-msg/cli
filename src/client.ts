@@ -2,6 +2,8 @@
 // the CLI layer seals/opens message bodies around these calls. Mirrors the Go
 // client's endpoints and error envelope.
 
+import { InstallationId, GitHubUserId } from "./ids.js";
+
 export interface ApiErrorBody {
   error: string;
   message?: string;
@@ -26,6 +28,7 @@ export interface RegisterResponse {
   token: string;
   github_login: string;
   github_user_id: string;
+  installation_id: string;
 }
 
 export interface GuestChallengeRequest {
@@ -63,6 +66,13 @@ export interface AddressCardDTO {
   signature: string;
   github_user_id?: string;
   github_login?: string;
+  // installation_box_key is this installation's X25519 public key (derived
+  // from the installation seed via HKDF — see installation-box.ts), the key
+  // shared-context envelopes must be sealed to. NOT public_key, which is
+  // either the installation's Ed25519 admission-signing key or (legacy
+  // /v1/register) unset. Absent on cards from installations that predate
+  // this field.
+  installation_box_key?: string;
 }
 
 export interface GuestRegistrationResponse {
@@ -166,6 +176,69 @@ export interface FeedbackResponse {
   feedback_id: string;
   kind: string;
   remaining_today: number;
+}
+
+export interface ContextDTO {
+  id: string;
+  name_enc: string;
+  owner_uid: string;
+  epoch: number;
+  version: number;
+  bytes: number;
+  sha256?: string;
+  updated_at: string;
+  role?: string;
+  download_url?: string;
+  sealed_key?: string;
+}
+
+export interface PutContextResponse {
+  upload_url: string;
+  blob_key: string;
+}
+
+/** One outstanding authorisation: a member whose installation has no
+ *  sealed-key envelope for the context's current epoch. Only returned by
+ *  GET /v1/contexts/pending to a caller who already holds a key themselves —
+ *  see api_context.go's handleListPendingContextKeys for why. */
+export interface PendingKeyDTO {
+  context_id: string;
+  epoch: number;
+  github_user_id: GitHubUserId;
+  role: string;
+  recipient_installation: InstallationId;
+}
+
+/** One sealed-key envelope, addressed to the recipient's installation id
+ *  (never a session id — see the R2/R3 rework). */
+export interface KeyEnvelope {
+  recipient_installation: InstallationId;
+  sealed_key: string;
+}
+
+/** One member of a context, as returned by GET /v1/contexts/{id}/members.
+ *  installation_id and installation_box_key are the server's own,
+ *  always-current record of the member's addressable installation and its
+ *  PUBLIC box key (safe to publish — a box key is a public key) — the
+ *  authoritative source for sealing a fresh envelope to this member,
+ *  regardless of whether they are in the caller's local contact book and
+ *  regardless of whether the caller's cached copy of their box key (if any)
+ *  is stale. Both are absent for the owner row, who never registers a
+ *  recipient installation. */
+export interface MemberDTO {
+  github_user_id: GitHubUserId;
+  role: string;
+  added_at: string;
+  installation_id?: InstallationId;
+  installation_box_key?: string;
+}
+
+/** Thrown on 409 so callers can merge rather than parse an error string. */
+export class VersionConflict extends Error {
+  constructor(public currentVersion: number) {
+    super(`version conflict; current version is ${currentVersion}`);
+    this.name = "VersionConflict";
+  }
 }
 
 import { normalizeServerUrl } from "./serverurl.js";
@@ -293,8 +366,11 @@ export class Client {
     return (raw ? JSON.parse(raw) : {}) as T;
   }
 
-  register(credential: string): Promise<RegisterResponse> {
-    return this.call("POST", "/v1/register", { credential });
+  register(credential: string, installationBoxKey?: string): Promise<RegisterResponse> {
+    return this.call("POST", "/v1/register", {
+      credential,
+      ...(installationBoxKey ? { installation_box_key: installationBoxKey } : {}),
+    });
   }
 
   guestChallenge(input: GuestChallengeRequest): Promise<GuestChallengeResponse> {
@@ -492,5 +568,106 @@ export class Client {
 
   portal(): Promise<{ url: string }> {
     return this.call("POST", "/v1/billing/portal");
+  }
+
+  createContext(nameEnc: string): Promise<ContextDTO> {
+    return this.call("POST", "/v1/contexts", { name_enc: nameEnc });
+  }
+
+  listContexts(): Promise<ContextDTO[]> {
+    return this.call("GET", "/v1/contexts");
+  }
+
+  getContext(id: string): Promise<ContextDTO> {
+    return this.call("GET", `/v1/contexts/${encodeURIComponent(id)}`);
+  }
+
+  putContext(id: string, expectedVersion: number, bytes: number, sha256: string): Promise<PutContextResponse> {
+    return this.call("PUT", `/v1/contexts/${encodeURIComponent(id)}`, {
+      expected_version: expectedVersion, bytes, sha256,
+    });
+  }
+
+  /** Finalise a write. Throws VersionConflict when another writer won.
+   *
+   *  Note on extraction: call() parses the JSON error envelope and stores the
+   *  *whole* parsed body on ApiError.details (see callOnce's `details = e as
+   *  unknown as Record<string, unknown>`). For this endpoint's 409 body,
+   *  `{"error":"version_conflict","current_version":N}`, that means
+   *  `error.details.current_version` holds N directly. ApiError.message does
+   *  NOT contain the number here: callOnce sets `msg = e.message || e.error ||
+   *  raw`, and since this envelope has no `message` field, msg falls back to
+   *  `e.error`, i.e. the literal string "version_conflict" — no digits, no raw
+   *  JSON. A regex over error.message (as the brief drafted) would always match
+   *  nothing and silently default to version 0. Reading `details.current_version`
+   *  is the only reliable path given what call() actually produces.
+   *
+   *  If the server's 409 body is missing `current_version` (or sends a
+   *  non-number), we do NOT manufacture VersionConflict(0) — a fabricated
+   *  version is worse than an exception, because a caller would silently merge
+   *  onto the wrong base and destroy the other writer's data with no error
+   *  anywhere. Instead the original ApiError is rethrown so the failure is
+   *  visible.
+   */
+  //  nameEnc, when supplied, replaces the context's encrypted name atomically
+  //  with the body under this same CAS (see shared.PutContextRequest.NameEnc
+  //  on the server). It is the rotation path: `context revoke` decrypts the
+  //  name with the OLD key and re-encrypts it with the fresh one, then sends
+  //  it here alongside the re-encrypted body, so a removed member who kept
+  //  the old key can never decrypt a name left behind under the new epoch.
+  //  undefined means "not supplied" and must be OMITTED from the request
+  //  body entirely (not sent as null/""), matching the server's *string
+  //  distinction between "absent" and "set to empty" — an ordinary
+  //  content-only commit must never risk blanking the stored name.
+  async commitContext(id: string, expectedVersion: number, bytes: number, sha256: string, blobKey: string, nameEnc?: string): Promise<ContextDTO> {
+    try {
+      const body: Record<string, unknown> = { expected_version: expectedVersion, bytes, sha256, blob_key: blobKey };
+      if (nameEnc !== undefined) body.name_enc = nameEnc;
+      return await this.call<ContextDTO>("POST", `/v1/contexts/${encodeURIComponent(id)}/commit`, body);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        const cv = e.details.current_version;
+        if (typeof cv !== "number" || !Number.isFinite(cv)) throw e;
+        throw new VersionConflict(cv);
+      }
+      throw e;
+    }
+  }
+
+  // recipientInstallation is the recipient's INSTALLATION id, not a session id
+  // — envelopes bind to installation (see rework-plan.md Task R2). An older
+  // brief called this field recipient_session; that name is stale and the
+  // server no longer recognizes it.
+  addContextMember(id: string, githubUserID: GitHubUserId, role: string, recipientInstallation: InstallationId, sealedKey: string): Promise<unknown> {
+    return this.call("POST", `/v1/contexts/${encodeURIComponent(id)}/members`, {
+      github_user_id: githubUserID, role, recipient_installation: recipientInstallation, sealed_key: sealedKey,
+    });
+  }
+
+  removeContextMember(id: string, githubUserID: GitHubUserId): Promise<ContextDTO> {
+    return this.call("DELETE", `/v1/contexts/${encodeURIComponent(id)}/members/${encodeURIComponent(githubUserID)}`);
+  }
+
+  /** Every current member of a context, with the server's own record of each
+   *  one's installation id and PUBLIC box key — the authoritative source for
+   *  sealing a fresh envelope to them (see MemberDTO). Restricted server-side
+   *  to callers who are themselves members. */
+  listContextMembers(id: string): Promise<MemberDTO[]> {
+    return this.call("GET", `/v1/contexts/${encodeURIComponent(id)}/members`);
+  }
+
+  /** Authorisations the caller could answer, across every context they belong
+   *  to. Empty for a caller who holds no key anywhere — see PendingKeyDTO. */
+  pendingContextKeys(): Promise<PendingKeyDTO[]> {
+    return this.call("GET", "/v1/contexts/pending");
+  }
+
+  /** Upload one or more sealed-key envelopes for a context's CURRENT epoch.
+   *  Used both by the owner re-keying after a revoke and by any other
+   *  keyholder answering a pending authorisation (piggyback answering). The
+   *  server refuses to overwrite a slot that already has an envelope, so
+   *  callers must only target empty slots (see rework-plan.md Task R4). */
+  uploadContextKeys(id: string, envelopes: KeyEnvelope[]): Promise<unknown> {
+    return this.call("POST", `/v1/contexts/${encodeURIComponent(id)}/keys`, { envelopes });
   }
 }

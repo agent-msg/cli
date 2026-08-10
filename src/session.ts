@@ -21,6 +21,7 @@ export interface AddressCard {
   signature: string;
   github_user_id?: string;
   github_login?: string;
+  installation_box_key?: string;
 }
 
 export interface Session {
@@ -38,6 +39,12 @@ export interface Session {
   installationId?: string;
   expiresAt?: string;
   addressCard?: AddressCard;
+  // installationBoxKey is this installation's X25519 public key, derived
+  // locally from the installation seed (installationBoxKeys() in
+  // installation-box.ts) — always available without a server round trip.
+  // Distinct from publicKey, this session's ephemeral messaging keypair:
+  // context keys must be sealed to installationBoxKey, never to publicKey.
+  installationBoxKey?: string;
 }
 
 // A profile selects an isolated subdirectory of the base home, so several
