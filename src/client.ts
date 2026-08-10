@@ -216,6 +216,23 @@ export interface KeyEnvelope {
   sealed_key: string;
 }
 
+/** One member of a context, as returned by GET /v1/contexts/{id}/members.
+ *  installation_id and installation_box_key are the server's own,
+ *  always-current record of the member's addressable installation and its
+ *  PUBLIC box key (safe to publish — a box key is a public key) — the
+ *  authoritative source for sealing a fresh envelope to this member,
+ *  regardless of whether they are in the caller's local contact book and
+ *  regardless of whether the caller's cached copy of their box key (if any)
+ *  is stale. Both are absent for the owner row, who never registers a
+ *  recipient installation. */
+export interface MemberDTO {
+  github_user_id: GitHubUserId;
+  role: string;
+  added_at: string;
+  installation_id?: InstallationId;
+  installation_box_key?: string;
+}
+
 /** Thrown on 409 so callers can merge rather than parse an error string. */
 export class VersionConflict extends Error {
   constructor(public currentVersion: number) {
@@ -616,6 +633,14 @@ export class Client {
 
   removeContextMember(id: string, githubUserID: GitHubUserId): Promise<ContextDTO> {
     return this.call("DELETE", `/v1/contexts/${encodeURIComponent(id)}/members/${encodeURIComponent(githubUserID)}`);
+  }
+
+  /** Every current member of a context, with the server's own record of each
+   *  one's installation id and PUBLIC box key — the authoritative source for
+   *  sealing a fresh envelope to them (see MemberDTO). Restricted server-side
+   *  to callers who are themselves members. */
+  listContextMembers(id: string): Promise<MemberDTO[]> {
+    return this.call("GET", `/v1/contexts/${encodeURIComponent(id)}/members`);
   }
 
   /** Authorisations the caller could answer, across every context they belong

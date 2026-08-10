@@ -25,6 +25,11 @@ let ctxSealedKey = ""; // sealed_key returned by GET /v1/contexts/c1
 let ctxDownloadContent = ""; // ciphertext served at /download-content
 let ctxHasContent = false;
 let pendingList: unknown[] = [];
+// Fixture for GET /v1/contexts/c1/members — the server's own, always-current
+// record of each member's installation id + PUBLIC box key. Tests set this
+// directly to control what the "server" reports, independently of whatever
+// (possibly stale, possibly absent) entry exists in the local contact book.
+let membersList: unknown[] = [];
 let uploadedEnvelopes: { context_id: string; envelopes: { recipient_installation: string; sealed_key: string }[] }[] = [];
 let removedMembers: string[] = [];
 let addedMembers: { github_user_id: string; role: string; recipient_installation: string; sealed_key: string }[] = [];
@@ -49,6 +54,7 @@ beforeEach(async () => {
   ctxDownloadContent = "";
   ctxHasContent = false;
   pendingList = [];
+  membersList = [];
   uploadedEnvelopes = [];
   removedMembers = [];
   addedMembers = [];
@@ -117,6 +123,9 @@ beforeEach(async () => {
       }
       if (req.url === "/v1/contexts/pending" && req.method === "GET") {
         return res.end(JSON.stringify(pendingList));
+      }
+      if (req.url === "/v1/contexts/c1/members" && req.method === "GET") {
+        return res.end(JSON.stringify(membersList));
       }
       if (req.url === "/v1/contexts/c1/keys" && req.method === "POST") {
         uploadedEnvelopes.push({ context_id: "c1", envelopes: body.envelopes || [] });
@@ -324,26 +333,23 @@ describe("agentmsg context", () => {
   // R4(b) — piggyback answering: any context command should, in passing,
   // answer outstanding pending authorisations it can — no daemon, no new
   // command, riding on a call the agent already makes.
-  it("answers a pending authorisation in passing when running an ordinary command", async () => {
+  it("answers a pending authorisation in passing when running an ordinary command, sourcing the box key from the server — not the local contact book", async () => {
     expect(await cli("register", "--dev-user", "9", "--allow-insecure-http")).toBe(0);
     await cli("context", "create", "--name", "n"); // we now hold c1's key locally
     const ourKey = new ContextKeys(home).get("c1")!;
 
-    // Bob is a known contact on a genuinely DIFFERENT installation: derive
-    // his box key from a distinct seed, exactly as a real second machine
-    // would, and give him an unrelated session messaging keypair too — the
-    // whole point of R4b is that these are NOT interchangeable. Sealing to
-    // bob's messaging key (as the pre-fix code did) would produce an
-    // envelope his installation box private key could never open; a test
-    // that fabricated one keypair and used it for both roles would never
-    // have caught that.
+    // Bob is on a genuinely DIFFERENT installation: derive his box key from a
+    // distinct seed, exactly as a real second machine would. Deliberately
+    // NOT added as a local contact — this is the propagation-gap scenario:
+    // the server, not the address book, is what makes him reachable. The
+    // server reports his installation id and current box key via
+    // GET /v1/contexts/c1/members, exactly as the real endpoint would for a
+    // genuine member.
     const bobSeed = Buffer.alloc(32, 0x42);
     const bobBoxKeys = installationBoxKeys(bobSeed);
-    const bobSessionKeys = await generateKeypair();
-    new Contacts(home).add("bob", {
-      sessionId: "s-bob", publicKey: bobSessionKeys.publicKey, githubUserId: "42",
-      installationBoxKey: bobBoxKeys.publicKey, installationId: "install-bob",
-    });
+    membersList = [
+      { github_user_id: "42", role: "writer", added_at: "", installation_id: "install-bob", installation_box_key: bobBoxKeys.publicKey },
+    ];
     pendingList = [{ context_id: "c1", epoch: 1, github_user_id: "42", role: "writer", recipient_installation: "install-bob" }];
 
     const code = await cli("context", "list"); // an ordinary command, not a new one
@@ -359,73 +365,66 @@ describe("agentmsg context", () => {
     // shared with the sealer) opens it, and it is the real context key.
     const opened = await open(envelope.sealed_key, bobBoxKeys.publicKey, bobBoxKeys.privateKey);
     expect(opened).toBe(ourKey);
-    // Negative pin: bob's SESSION messaging key must NOT be able to open it
-    // — sealing to the wrong key type must fail, not silently "work".
-    await expect(open(envelope.sealed_key, bobSessionKeys.publicKey, bobSessionKeys.privateKey)).rejects.toThrow();
   });
 
-  // R9: piggyback answering must match a candidate contact on BOTH
-  // githubUserId AND installationId, not githubUserId alone. Bob re-registers
-  // (or switches machines) and re-shares his card with the owner, but this
-  // keyholder's cached contact for him is still the OLD installation. If we
-  // seal with the stale contact's installationBoxKey, the envelope goes up
-  // addressed to Bob's NEW recipient_installation but is only openable by his
-  // OLD installation's private key — Bob can never open it, and because the
-  // server refuses to overwrite an existing envelope for that
-  // (context, epoch, recipient_installation) slot, he is then permanently
-  // locked out with no recovery path. The fix must skip a githubUserId match
-  // whose installationId disagrees with the pending entry's
-  // recipient_installation, leaving it pending for a keyholder with a
-  // current card to answer instead.
-  it("does not seal with a stale installation's box key when the recipient has moved to a new installation", async () => {
+  // The staleness defect this task closes: a local contact's cached box key
+  // for a member can be behind the truth (the member's installation rotated
+  // its key without every keyholder's cached copy catching up — this is
+  // exactly how the fifth defect in this feature locked a recipient out
+  // permanently). Piggyback answering must use the SERVER's current box key
+  // for the member's installation, never the local contact's, even when a
+  // local contact exists and even when it names the exact same installation
+  // id.
+  it("uses the server's current box key even when the local contact holds a stale one for the same installation", async () => {
     expect(await cli("register", "--dev-user", "9", "--allow-insecure-http")).toBe(0);
     await cli("context", "create", "--name", "n"); // we now hold c1's key locally
+    const ourKey = new ContextKeys(home).get("c1")!;
 
-    // Bob's OLD installation (the one this keyholder's cached contact still
-    // points to) and his NEW installation (the one the server is actually
-    // addressing the pending envelope to, after he re-registered elsewhere).
-    const bobOldSeed = Buffer.alloc(32, 0x11);
-    const bobOldBoxKeys = installationBoxKeys(bobOldSeed);
-    const bobNewSeed = Buffer.alloc(32, 0x22);
-    const bobNewBoxKeys = installationBoxKeys(bobNewSeed);
+    const staleSeed = Buffer.alloc(32, 0x11);
+    const staleBoxKeys = installationBoxKeys(staleSeed);
+    const currentSeed = Buffer.alloc(32, 0x22);
+    const currentBoxKeys = installationBoxKeys(currentSeed);
 
+    // Bob's local contact entry names the CORRECT installation id but an
+    // OUTDATED box key for it.
     new Contacts(home).add("bob", {
-      sessionId: "s-bob-old", publicKey: (await generateKeypair()).publicKey, githubUserId: "42",
-      installationBoxKey: bobOldBoxKeys.publicKey, installationId: "install-bob-old",
+      sessionId: "s-bob", publicKey: (await generateKeypair()).publicKey, githubUserId: "42",
+      installationBoxKey: staleBoxKeys.publicKey, installationId: "install-bob",
     });
-    pendingList = [{ context_id: "c1", epoch: 1, github_user_id: "42", role: "writer", recipient_installation: "install-bob-new" }];
+    // The server reports the CURRENT box key for that same installation id.
+    membersList = [
+      { github_user_id: "42", role: "writer", added_at: "", installation_id: "install-bob", installation_box_key: currentBoxKeys.publicKey },
+    ];
+    pendingList = [{ context_id: "c1", epoch: 1, github_user_id: "42", role: "writer", recipient_installation: "install-bob" }];
 
     const code = await cli("context", "list");
     expect(code).toBe(0);
 
-    // The critical assertion: nothing gets uploaded. Sealing with the stale
-    // contact's box key and addressing it to "install-bob-new" would produce
-    // an envelope Bob can never open, and would permanently burn that slot.
-    expect(uploadedEnvelopes).toHaveLength(0);
-
-    // Recovery: once a keyholder has Bob's CURRENT card (matching both
-    // githubUserId and his new installationId), the same pending entry must
-    // still be answerable — Bob is not permanently locked out.
-    new Contacts(home).add(
-      "bob",
-      {
-        sessionId: "s-bob-new", publicKey: (await generateKeypair()).publicKey, githubUserId: "42",
-        installationBoxKey: bobNewBoxKeys.publicKey, installationId: "install-bob-new",
-      },
-      true,
-    );
-
-    const code2 = await cli("context", "list");
-    expect(code2).toBe(0);
-
     expect(uploadedEnvelopes).toHaveLength(1);
     expect(uploadedEnvelopes[0].envelopes).toHaveLength(1);
     const envelope = uploadedEnvelopes[0].envelopes[0];
-    expect(envelope.recipient_installation).toBe("install-bob-new");
-    const opened = await open(envelope.sealed_key, bobNewBoxKeys.publicKey, bobNewBoxKeys.privateKey);
-    expect(opened).toBe(new ContextKeys(home).get("c1"));
-    // Negative pin: Bob's OLD installation private key must NOT open it.
-    await expect(open(envelope.sealed_key, bobOldBoxKeys.publicKey, bobOldBoxKeys.privateKey)).rejects.toThrow();
+    expect(envelope.recipient_installation).toBe("install-bob");
+    // Openable with the server's CURRENT key...
+    const opened = await open(envelope.sealed_key, currentBoxKeys.publicKey, currentBoxKeys.privateKey);
+    expect(opened).toBe(ourKey);
+    // ...and NOT with the stale one the local contact book held — proving
+    // the stale local copy was never used to seal.
+    await expect(open(envelope.sealed_key, staleBoxKeys.publicKey, staleBoxKeys.privateKey)).rejects.toThrow();
+  });
+
+  // A pending entry the server's member list has no current box key for
+  // (e.g. installation info never reported) must stay pending — there is
+  // nothing safe to seal with — rather than the command failing outright.
+  it("leaves a pending entry unanswered when the server reports no box key for that installation", async () => {
+    expect(await cli("register", "--dev-user", "9", "--allow-insecure-http")).toBe(0);
+    await cli("context", "create", "--name", "n");
+
+    membersList = [{ github_user_id: "42", role: "writer", added_at: "" }]; // no installation_id/box_key
+    pendingList = [{ context_id: "c1", epoch: 1, github_user_id: "42", role: "writer", recipient_installation: "install-bob" }];
+
+    const code = await cli("context", "list");
+    expect(code).toBe(0);
+    expect(uploadedEnvelopes).toHaveLength(0);
   });
 
   // R4b: 'share' must seal to the recipient's INSTALLATION box key, derived
@@ -586,6 +585,54 @@ describe("agentmsg context", () => {
       expect(removedMembers).toContain("99");
       const msg = errs.join("");
       expect(msg).not.toMatch(/protects|no longer decrypts|rotated/i);
+    });
+
+    // The propagation gap this task closes: rotation must reach a remaining
+    // member who is NOT in the acting owner's local contacts. Before this
+    // change, the owner's re-key pass (piggybacked through
+    // answerPendingContextKeys) could only address members it found in its
+    // own address book — a remaining member added by someone else, who never
+    // exchanged cards with this owner, would get no envelope at all until
+    // some unrelated third party who did have them as a contact happened to
+    // run a command. Carol here is exactly that member: a genuine remaining
+    // member of c1, deliberately never added to this owner's contacts.
+    it("delivers the rotated key to a remaining member who is not in the owner's contacts (propagation gap)", async () => {
+      expect(await cli("register", "--dev-user", "9", "--allow-insecure-http")).toBe(0);
+      await cli("context", "create", "--name", "n"); // we hold c1's key locally
+
+      const carolSeed = Buffer.alloc(32, 0x33);
+      const carolBoxKeys = installationBoxKeys(carolSeed);
+      // Carol is a current member per the server's own membership record...
+      membersList = [
+        { github_user_id: "1", role: "owner", added_at: "" },
+        {
+          github_user_id: "77", role: "writer", added_at: "",
+          installation_id: "install-carol", installation_box_key: carolBoxKeys.publicKey,
+        },
+      ];
+      // Deliberately NOT added to Contacts(home) — that is the whole point.
+
+      const code = await cli("context", "revoke", "--id", "c1", "--user", "99");
+      expect(code).toBe(0);
+      const rotatedKey = new ContextKeys(home).get("c1")!;
+
+      // Carol becomes pending for the new epoch once rotation has happened —
+      // she has no envelope yet for it, exactly as the real server derives
+      // it (see handleListPendingContextKeys). Any subsequent ordinary
+      // command answers what it can, piggybacked.
+      pendingList = [{ context_id: "c1", epoch: ctxEpoch, github_user_id: "77", role: "writer", recipient_installation: "install-carol" }];
+      const code2 = await cli("context", "list");
+      expect(code2).toBe(0);
+
+      const carolEnvelope = uploadedEnvelopes
+        .flatMap((u) => u.envelopes)
+        .find((e) => e.recipient_installation === "install-carol");
+      expect(carolEnvelope).toBeDefined();
+      // Genuinely usable on Carol's machine: her installation box private
+      // key, derived independently from her own seed, opens it, and it is
+      // the real (rotated) context key — not the pre-revoke one.
+      const opened = await open(carolEnvelope!.sealed_key, carolBoxKeys.publicKey, carolBoxKeys.privateKey);
+      expect(opened).toBe(rotatedKey);
     });
   });
 

@@ -3,7 +3,7 @@
 // known (a saved contact), the message body is sealed on THIS machine before it
 // reaches the client, so the server only ever sees ciphertext.
 import { generateKeypair, seal, open, sealBytes, openBytes, generateContextKey, encryptSym, decryptSym } from "./crypto.js";
-import { Client, ApiError, VersionConflict, ContextDTO, KeyEnvelope } from "./client.js";
+import { Client, ApiError, VersionConflict, ContextDTO, KeyEnvelope, MemberDTO } from "./client.js";
 import {
   SessionStore,
   Session,
@@ -836,50 +836,73 @@ function noLocalKeyMessage(id: string, resolved: ResolvedContextKey): string {
 }
 
 // Piggyback answering: rides on any context command the agent already runs.
-// For each outstanding pending authorisation we hold the key for and know a
-// public key for (a saved contact), seal it and upload. Quiet on success,
-// and a failure here must never break the command the user actually asked
-// for — hence the outer try/catch swallowing everything.
+// For each outstanding pending authorisation we hold the key for, seal it and
+// upload. Quiet on success, and a failure here must never break the command
+// the user actually asked for — hence the outer try/catch swallowing
+// everything.
+//
+// The recipient's box key is sourced from the SERVER's per-context member
+// list (GET /v1/contexts/{id}/members), never from the local contact book.
+// Two things this closes, both real defects in earlier revisions of this
+// feature:
+//
+//   - Propagation gap: a pending member reached only through the acting
+//     keyholder's own address book is invisible whenever that member was
+//     added by someone else and never exchanged cards with this keyholder.
+//     The server already knows every current member's installation and box
+//     key (it is the authority that granted them access in the first
+//     place), so reading from there means every pending member is reachable,
+//     contacts or not.
+//   - Staleness: a locally cached contact's installationBoxKey can lag the
+//     truth if the member's installation rotates its key without every
+//     keyholder's cached copy catching up. The server's member list is
+//     always current, so this can never seal with a box key that isn't the
+//     one currently on file for that installation slot.
+//
+// A pending entry whose installation the server's member list has no CURRENT
+// box key for (e.g. a member added without ever registering one) is left
+// pending rather than answered with anything — there is nothing safe to seal
+// with.
 async function answerPendingContextKeys(
   client: Client,
   keys: ContextKeys,
-  contacts: Contacts,
   selfInstallationId?: InstallationId,
 ): Promise<void> {
   try {
     const pending = await client.pendingContextKeys();
     if (!Array.isArray(pending) || pending.length === 0) return;
     const byContext = new Map<string, KeyEnvelope[]>();
-    const book = contacts.list();
+    // Box keys are per-context (a member's installation only needs looking
+    // up once per context, however many pending entries it has), fetched
+    // lazily and cached across this pass.
+    const boxKeysByContext = new Map<string, Map<InstallationId, string>>();
+    async function boxKeyFor(contextId: string, installationId: InstallationId): Promise<string | undefined> {
+      let byInstallation = boxKeysByContext.get(contextId);
+      if (!byInstallation) {
+        byInstallation = new Map();
+        try {
+          const members: MemberDTO[] = await client.listContextMembers(contextId);
+          for (const m of members) {
+            if (m.installation_id && m.installation_box_key) {
+              byInstallation.set(m.installation_id, m.installation_box_key);
+            }
+          }
+        } catch {
+          // Leave byInstallation empty; every entry for this context stays
+          // pending this round rather than failing the whole command.
+        }
+        boxKeysByContext.set(contextId, byInstallation);
+      }
+      return byInstallation.get(installationId);
+    }
     for (const p of pending) {
       if (!p?.context_id || !p.recipient_installation) continue;
       if (selfInstallationId && p.recipient_installation === selfInstallationId) continue;
       const key = keys.get(p.context_id);
       if (!key) continue; // we can't answer for a context we hold no key for
-      // Match on githubUserId AND installationId, never githubUserId alone.
-      // A member can re-register (or switch machines) and re-share their
-      // card with the owner without every other keyholder's cached contact
-      // catching up — that keyholder's book then still has the member's OLD
-      // installationId under the same githubUserId. Sealing with that stale
-      // contact's installationBoxKey would produce an envelope addressed to
-      // the member's CURRENT recipient_installation but only openable by
-      // their OLD installation's private key: unopenable, and because the
-      // server refuses to overwrite an existing envelope for that
-      // (context, epoch, recipient_installation) slot, permanently so — the
-      // member is silently and permanently locked out (see R9). Treat any
-      // entry with no fully-current contact as unanswerable and leave it
-      // pending, rather than ever seal with a key from a different
-      // installation.
-      const contact = book.find(
-        (c) => c.githubUserId && c.githubUserId === p.github_user_id && c.installationId === p.recipient_installation,
-      );
-      // Seal to their INSTALLATION box key, not contact.publicKey (their
-      // session's ephemeral messaging keypair) — sealing to the wrong key
-      // produces an envelope their resolveContextKey() can never open. A
-      // contact saved before this field existed has none yet; skip them
-      // rather than send an unopenable envelope (see R4b).
-      if (!contact?.installationBoxKey) continue;
-      const sealedKey = await seal(key, contact.installationBoxKey);
+      const boxKey = await boxKeyFor(p.context_id, p.recipient_installation);
+      if (!boxKey) continue;
+      const sealedKey = await seal(key, boxKey);
       const list = byContext.get(p.context_id) ?? [];
       list.push({ recipient_installation: p.recipient_installation, sealed_key: sealedKey });
       byContext.set(p.context_id, list);
@@ -918,7 +941,7 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
 
   // Any context command answers what pending authorisations it can, in
   // passing — no daemon, no separate command.
-  await answerPendingContextKeys(client, keys, contacts, selfInstallationId);
+  await answerPendingContextKeys(client, keys, selfInstallationId);
 
   if (sub === "create") {
     const name = args.flags.name !== undefined ? String(args.flags.name) : "";
@@ -1141,7 +1164,7 @@ async function cmdContext(args: ReturnType<typeof parseArgs>, store: SessionStor
           // server until this resolves.
           note("warning: could not resolve our own installation id, so the fresh key was not uploaded for the server to hand to other sessions on this machine. It is saved locally here, though.");
         }
-        await answerPendingContextKeys(client, keys, contacts, selfInstallationId);
+        await answerPendingContextKeys(client, keys, selfInstallationId);
         rotated = true;
       } catch (e) {
         note(`warning: key rotation after revoke did not fully complete (${(e as Error).message}). ` +
