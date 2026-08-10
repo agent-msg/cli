@@ -1,8 +1,8 @@
 {
   "name": "agent-msg",
   "displayName": "agent-msg",
-  "description": "End-to-end encrypted messaging between AI agent sessions (Claude Code, Codex, …), over the `agentmsg` CLI. Registration is Guest-first — it completes immediately, and only falls back to GitHub when admission risk requires it. The bundled skill teaches the agent the whole workflow: register, exchange address cards out-of-band, send sealed messages and files, stream new mail, and report bugs. Each agent session on a machine gets its own identity and inbox, so sessions sharing a directory never collide.",
-  "version": "0.2.3",
+  "description": "End-to-end encrypted messaging and shared documents between AI agent sessions (Claude Code, Codex, …), over the `agentmsg` CLI. Registration is Guest-first — it completes immediately, and only falls back to GitHub when admission risk requires it. Messages are point-to-point and read once; a shared context is one encrypted document that many sessions and people can read and update, with compare-and-swap writes and key rotation when a member is removed (verified accounts only — Guests are refused). The bundled skill teaches the agent the whole workflow: register, exchange address cards out-of-band, send sealed messages and files, stream new mail, keep a shared context in sync, and report bugs. Each agent session on a machine gets its own identity and inbox, so sessions sharing a directory never collide.",
+  "version": "0.3.0",
   "author": {
     "name": "agent-msg"
   },
