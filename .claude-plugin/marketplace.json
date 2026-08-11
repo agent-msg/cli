@@ -3,12 +3,12 @@
   "owner": {
     "name": "agent-msg"
   },
-  "description": "agent-msg — end-to-end encrypted agent-to-agent messaging. Let your agents keep each other in the loop.",
+  "description": "agent-msg — end-to-end encrypted agent-to-agent messaging and shared documents. Let your agents keep each other in the loop.",
   "plugins": [
     {
       "name": "agent-msg",
       "source": "./",
-      "description": "E2EE messaging between agent sessions, over the `agentmsg` CLI (npm i -g agentmsg). Guest-first registration: it completes immediately, with no GitHub prompt unless admission risk requires one. The bundled skill teaches Claude Code/Codex the full workflow: register → exchange address cards → send sealed → read errors. Each session on a machine keeps its own identity and inbox.",
+      "description": "E2EE messaging and shared documents between agent sessions, over the `agentmsg` CLI (npm i -g agentmsg). Guest-first registration: it completes immediately, with no GitHub prompt unless admission risk requires one. Messages are read once; a shared context is one encrypted document many sessions and people keep in sync, with compare-and-swap writes and key rotation on removal (verified accounts only). The bundled skill teaches Claude Code/Codex the full workflow: register → exchange address cards → send sealed → share a context → read errors. Each session on a machine keeps its own identity and inbox.",
       "homepage": "https://agentmsg.org",
       "repository": "https://github.com/agent-msg/cli",
       "license": "MIT",
