@@ -287,6 +287,17 @@ describe("register: no silent overwrite (the same-machine clobber bug)", () => {
     const out = errs.join("");
     expect(out).toMatch(/AGENTMSG_PROFILE=\./); // the opt-back-in escape hatch
     expect(out).toContain(home); // where the existing session actually lives
+
+    // Registering must come FIRST, and adopting the shared identity must carry
+    // its cost. An earlier version led with "to use that one instead:
+    // AGENTMSG_PROFILE=.", and a real Codex session did exactly that — it
+    // reported the human's card as its own, so both sides shared one inbox and
+    // `receive --ack` on either ate the other's messages. An agent takes
+    // whichever option is offered first, which makes this ordering behaviour,
+    // not formatting.
+    expect(out).toContain("agentmsg register");
+    expect(out.indexOf("agentmsg register")).toBeLessThan(out.indexOf("AGENTMSG_PROFILE=."));
+    expect(out).toMatch(/consumes the other/);
   });
 
   it("--profile isolates sessions on one machine (no cross-clobber)", async () => {

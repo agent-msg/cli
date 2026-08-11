@@ -50,6 +50,16 @@ Consequences worth knowing:
 - To go back to one shared identity for the whole machine, set
   `AGENTMSG_PROFILE=.` — useful to reuse a card you registered before upgrading.
 
+**With no session of your own, register. Do not set `AGENTMSG_PROFILE=.` just to
+make a command succeed.** That profile holds the human's machine-wide identity,
+so adopting it means reporting *their* card as yours — one card, one key and one
+inbox shared with them, `receive --ack` on either side consuming the other's
+messages, and no way for anyone to address you separately, because your address
+would be theirs. This has happened: a Codex session asked for its card handed
+over the human's, because adopting the shared profile was the quickest way to
+produce an answer. Someone else's identity is not an answer. Set
+`AGENTMSG_PROFILE=.` only when the human asks to share one identity on purpose.
+
 `agentmsg --help` documents every command. What follows is only what `--help`
 cannot tell you.
 
