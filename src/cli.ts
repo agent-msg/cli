@@ -177,15 +177,31 @@ function cmdSkill(args: ReturnType<typeof parseArgs>): number {
 function loadSessionOrExit(store: SessionStore, home?: string): Session {
   const s = store.load();
   if (!s) {
-    note("no active session; run 'agentmsg register' first");
     // This session got its own home (auto-derived from the agent session it runs
-    // in). If a session predating that isolation sits in the shared base home,
-    // it is not gone — it just isn't ours. Say where it is and how to adopt it.
+    // in). A session in the shared base home is not gone — it just isn't ours.
+    //
+    // Registering must be the headline. An earlier version led with "an existing
+    // shared session is in <base> — to use that one instead", and a Codex
+    // session reading it did exactly that: it adopted the human's machine
+    // identity and reported that card as its own. Two parties then shared one
+    // card and one inbox, so `receive --ack` in either consumed the other's
+    // messages — the collision isolation exists to prevent, reintroduced by the
+    // remediation text. An agent optimising for "make the command work" takes
+    // whichever option is offered first, so the order here is load-bearing, and
+    // the cost of the alternative has to be stated rather than implied.
     const base = baseHome();
-    if (home && home !== base && new SessionStore(base).exists()) {
-      note(`   note: this agent session uses its own home (${home}), so sessions no longer collide.`);
-      note(`   An existing shared session is in ${base} — to use that one instead:`);
+    const sharedExists = !!home && home !== base && new SessionStore(base).exists();
+    if (sharedExists) {
+      note(`no active session for this agent session (its own home is ${home}).`);
+      note(`   Register one — keeps this session's own card and inbox:`);
+      note(`      agentmsg register              # Guest, immediate`);
+      note(`      agentmsg register --verified   # verified; required for shared context`);
+      note(`   Or adopt the machine-wide session in ${base}:`);
       note(`      export AGENTMSG_PROFILE=.`);
+      note(`      ^ shares one card and one inbox with everything else using it;`);
+      note(`        'receive --ack' in one then consumes the other's messages.`);
+    } else {
+      note("no active session; run 'agentmsg register' first");
     }
     process.exit(1);
   }
@@ -329,6 +345,29 @@ async function cmdRegister(args: ReturnType<typeof parseArgs>, store: SessionSto
   // unable to tell WHICH session. Minting an identity anyway would put every
   // session back on one card and one inbox — the exact bug isolation fixes, only
   // now invisible. Stop, and hand the human a value they can paste.
+  // About to mint an identity in a profile that has none, while the machine
+  // already has one. Registering is still the right default — every agent
+  // session should own its card and inbox — but the existing identity has to be
+  // named, because plain `register` produces a Guest: no github_user_id, and
+  // shared context refuses it outright. A verified user who is never told this
+  // walks away with a downgraded identity and no idea the other one exists.
+  // Informs and continues; refusing here would interrupt the ordinary case
+  // where each new agent session legitimately registers its own.
+  const base = baseHome();
+  if (home && home !== base && !args.flags.verified) {
+    const shared = new SessionStore(base).load();
+    if (shared) {
+      note(`note: this machine already has a ${shared.identityType === "github" ? "verified" : "Guest"} identity in ${base}` +
+        (shared.githubLogin ? ` (${shared.githubLogin})` : "") + ".");
+      note(`   Registering here gives THIS agent session its own card and inbox, which is usually what you want.`);
+      if (shared.identityType === "github") {
+        note(`   Plain 'register' makes this session a Guest — no github_user_id, and shared context refuses Guests.`);
+        note(`   Use 'agentmsg register --verified' to verify this session too.`);
+      }
+      note(`   To reuse the existing identity instead of a new one:  export AGENTMSG_PROFILE=.`);
+    }
+  }
+
   const runtime = detectAgentRuntime();
   if (runtime && !agentSessionProfile() && !args.flags.profile && !process.env.AGENTMSG_PROFILE) {
     const suggestion = suggestedSessionName();
