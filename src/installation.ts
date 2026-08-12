@@ -116,6 +116,34 @@ function hardenWindowsDirectory(path: string): void {
   }
 }
 
+/**
+ * What a single ACL probe told us. Exported for testing: the decision is the
+ * part that was wrong, and it cannot be exercised on a non-Windows machine
+ * through the spawn itself.
+ *
+ * The distinction is the whole point. `spawnSync` reports a timeout or a
+ * failure to start as `status === null`, and the previous code tested
+ * `status !== 0`, so "we learned nothing" was reported to the user as "your key
+ * permissions are unsafe" — a security claim about a check that never ran. On a
+ * loaded Windows machine (CI, or a laptop mid-virus-scan) a cold powershell.exe
+ * can exceed the budget, and the CLI then refuses to work and sends the human
+ * off to inspect ACLs that are perfectly fine.
+ */
+export type AclProbe = { status: number | null; error?: unknown; stdout?: string; stderr?: string };
+export type AclVerdict = { kind: "safe" } | { kind: "unsafe"; detail: string } | { kind: "indeterminate"; detail: string };
+
+export function interpretAclProbe(p: AclProbe): AclVerdict {
+  const detail = `${p.stdout ?? ""} ${p.stderr ?? ""}`.trim().replace(/\s+/g, " ");
+  if (p.status === 0) return { kind: "safe" };
+  // No exit status means the process never delivered a verdict: killed on
+  // timeout, or never started (powershell.exe missing, blocked by policy).
+  if (p.status === null) {
+    const why = p.error instanceof Error ? p.error.message : String(p.error ?? "no exit status");
+    return { kind: "indeterminate", detail: detail ? `${why}: ${detail}` : why };
+  }
+  return { kind: "unsafe", detail };
+}
+
 function validateWindowsPrivateFile(path: string): void {
   if (process.env.NODE_ENV === "test" && process.env.AGENTMSG_TEST_SKIP_WINDOWS_ACL === "1") return;
   const script = [
@@ -131,20 +159,38 @@ function validateWindowsPrivateFile(path: string): void {
     "$bad=@($rules | Where-Object {$allowed -notcontains $_})",
     "if($bad.Count -ne 0){Write-Output ('owner='+$owner);Write-Output ('rules='+($rules -join ','));exit 3}",
   ].join(";");
-  const result = spawnSync(
-    "powershell.exe",
-    ["-NoProfile", "-NonInteractive", "-Command", script],
-    {
-      encoding: "utf8",
-      timeout: 10_000,
-      windowsHide: true,
-      env: { ...process.env, AGENTMSG_ACL_PATH: path },
-      stdio: ["ignore", "pipe", "pipe"],
-    },
-  );
-  if (result.status !== 0) {
-    const detail = `${result.stdout} ${result.stderr}`.trim().replace(/\s+/g, " ");
-    throw new Error(`installation key Windows ACL or owner is unsafe${detail ? ` (${detail})` : ""}`);
+  const probe = (timeout: number): AclVerdict =>
+    interpretAclProbe(spawnSync(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-Command", script],
+      {
+        encoding: "utf8",
+        timeout,
+        windowsHide: true,
+        env: { ...process.env, AGENTMSG_ACL_PATH: path },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    ));
+
+  let verdict = probe(10_000);
+  // Retry once, patiently, before concluding anything. The common cause of an
+  // indeterminate first attempt is a cold interpreter on a busy machine, and
+  // that resolves on a second try — whereas a genuinely wrong ACL returns its
+  // verdict immediately and is not retried.
+  if (verdict.kind === "indeterminate") verdict = probe(60_000);
+
+  if (verdict.kind === "unsafe") {
+    throw new Error(`installation key Windows ACL or owner is unsafe${verdict.detail ? ` (${verdict.detail})` : ""}`);
+  }
+  if (verdict.kind === "indeterminate") {
+    // Still fail closed — the key may genuinely be exposed — but say what
+    // actually happened, so the human debugs the real problem instead of
+    // hunting for an ACL fault that was never observed.
+    throw new Error(
+      `could not verify the installation key's Windows ACL (${verdict.detail}). ` +
+      `The permissions were NOT found to be wrong — the check itself did not complete. ` +
+      `Retry; if it persists, confirm powershell.exe runs from this shell.`,
+    );
   }
 }
 
